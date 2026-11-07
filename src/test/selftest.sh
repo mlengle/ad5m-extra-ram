@@ -63,29 +63,38 @@ trap '[ -n "$FINISHED" ] || cleanup' EXIT
 
 log "start up=$(cut -d" " -f1 /proc/uptime) nodsp=$(grep -cwE "xram_on|zmod_nodsp|zmod_mem" "$XR_CMDLINE") memtotal=$(awk "/MemTotal/{print \$2}" "$XR_MEMINFO") tee_rsv=$(grep -c 41b00000 "$XR_MEMBLOCK" 2>/dev/null) soak=${XR_SOAK}s"
 "$H/cpu1test.sh" & CP=$!; wait $CP
-E=$(grep -c "cpu1 on rc=0 online=0-1" cpu1test-$B.log 2>/dev/null)
-E=${E:-0}; log "cpu1 early: $E"
+# the early round counts only when cpu1 really went offline ("online=0") and came back ("online=0-1");
+# lines are anchored at the end so that "online=0-1" never passes for "online=0"
+E=0
+grep -q " cpu1 off rc=0 online=0$" cpu1test-$B.log 2>/dev/null && grep -q " cpu1 on rc=0 online=0-1$" cpu1test-$B.log 2>/dev/null && E=1
+log "cpu1 early: $E"
 "$XR_PYTHON" -I "$H/monitor.py" --out "$D" > monitor.err 2>&1 &
 MP=$!
 "$XR_PYTHON" -I "$H/harvest.py" --out "$D" --rounds 16 --interval 30 > harvest.err 2>&1 &
 HP=$!
 sleep "$XR_SOAK" & SP=$!; wait $SP
 "$H/cpu1multi.sh" & CP=$!; wait $CP
-M=$(grep -c "online=0-1" cpu1multi-$B.log 2>/dev/null)
+# a round counts when its "offline=0" line (cpu1 really offline) is followed by its "online=0-1" line
+M=$(awk '$2 == "round" && $4 == "offline=0" && NF == 4 { off[$3] = 1 }
+    $2 == "round" && $4 == "online=0-1" && NF == 4 && off[$3] { n++; off[$3] = 0 }
+    END { print n + 0 }' cpu1multi-$B.log 2>/dev/null)
 M=${M:-0}; log "cpu1 multi ok rounds: $M"
 kill $(cat harvest.pid 2>/dev/null) $(cat monitor.pid 2>/dev/null) 2>/dev/null
 kill $HP $MP 2>/dev/null
 await_harvest
 FINISHED=1
 HB=$(grep -cE "MISMATCH|MOVED|ALERT" harvest.log 2>/dev/null)
-KB=$(grep -ciE "bad page|unable to handle|external abort|oom|allocation failure" kernel-$B.log 2>/dev/null)
-HB=${HB:-0}; KB=${KB:-0}
+# kernel errors fail the test; page allocation failures (a normal warning under memory pressure) are only counted
+KB=$(grep -ciE "Out of memory|oom-kill|Bad page|Unable to handle|external abort" kernel-$B.log 2>/dev/null)
+KA=$(grep -ci "allocation failure" kernel-$B.log 2>/dev/null)
+HB=${HB:-0}; KB=${KB:-0}; KA=${KA:-0}
 HELD=$(grep " HARVEST held=" harvest.log 2>/dev/null | tail -n 1 | sed -n 's/.* held=\([0-9]*\)\/.*/\1/p')
 log "harvest: $(tail -n 1 harvest.log 2>/dev/null)"
 log "harvest held pages: ${HELD:-none}"
 log "harvest bad lines: $HB"
 log "range: $(tail -n 1 monitor-$B.csv 2>/dev/null | cut -d, -f6,12-15)"
 log "kernel bad: $KB"
+log "kernel allocation failures (info): $KA"
 log SUMMARY-DONE
 # PASS: all 4 CPU1 rounds (1 early + 3 multi) came back online, nothing wrong in the harvester or the
 # kernel log, and the harvester really held pages (a harvester that never ran must not pass)

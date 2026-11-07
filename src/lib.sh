@@ -25,6 +25,8 @@
 : ${XR_SELFTEST:=$XR_CODE/test/selftest.sh}   # the memory self-test (tests stub it)
 : ${XR_PYTHON:=/usr/bin/python3}       # the harvester of the self-test needs it
 : ${XR_WAIT_STEP:=5}                   # poll interval of xr_zmod_wait, seconds (tests lower it)
+: ${XR_UPTIME:=/proc/uptime}
+: ${XR_ARM_DELAY:=180}                 # the boot hook arms only after the system has been up this many seconds
 
 # --- verified firmware list: "dtb-md5 CRC optee-md5" triplets (firmware 3.1.5) ---
 # CRC is the crc32 of sunxi.dtb as the printer's U-Boot prints it; the OP-TEE md5 is required in both
@@ -172,6 +174,17 @@ xr_fw_check() {
 # xr_bootcmd runs once: it restores the stock bootcmd and saves it first, so a hang or power cycle
 # later returns to the stock boot; then it runs xram_main.
 xr_bootcmd='setenv bootcmd run setargs_mmc boot_dsp0 boot_uImage;saveenv;run setargs_mmc xram_main'
+# bootcmd values armed by earlier versions of extra-ram (newline-separated; empty while there is only one
+# version). They count as ours wherever bootcmd is recognised, so an upgrade can disarm and re-arm them.
+: ${XR_OLD_BOOTCMDS:=}
+
+# xr_is_ours BOOTCMD: succeeds when BOOTCMD is our armed bootcmd (this version's or an older one's)
+xr_is_ours() {
+    [ -n "$1" ] || return 1
+    [ "$1" = "$xr_bootcmd" ] && return 0
+    [ -n "$XR_OLD_BOOTCMDS" ] || return 1
+    printf '%s\n' "$XR_OLD_BOOTCMDS" | grep -qxF -- "$1"
+}
 # Scratch word for the crc32 result, inside the dtb gap below the dtb load address (0x44864e70)
 XR_SCRATCH=0x44864e00
 # xram_main: load, compute the dtb CRC into xram_crc (mw.l first: crc32 must not leave stale data),
@@ -191,7 +204,11 @@ xr_getenv() {
 # xr_env_values CRC EMMC_EDITS: set XV_MAIN, XV_BOOT, XV_DEL, XV_SKIP (the values of xram_main,
 # xram_boot, xram_del, xram_skip). EMMC_EDITS may be empty.
 xr_env_values() {
-    XV_MAIN="${XR_MAIN_PRE}$1${XR_MAIN_POST}"
+    # U-Boot's setexpr prints the CRC without leading zeros: strip them here too (string operations, not
+    # $((0x...)): a 32-bit shell arithmetic would turn a CRC above 0x7fffffff negative)
+    _xr_crc=$1
+    while [ "${_xr_crc#0}" != "$_xr_crc" ] && [ "${#_xr_crc}" -gt 1 ]; do _xr_crc=${_xr_crc#0}; done
+    XV_MAIN="${XR_MAIN_PRE}${_xr_crc}${XR_MAIN_POST}"
     XV_BOOT="fdt addr 0x44864e70;fdt resize;${2:+$2;}${XR_BOOTM}"
     XV_DEL=$XR_DEL
     XV_SKIP=$XR_SKIP
@@ -241,12 +258,12 @@ xr_arm() {
     return 1
 }
 
-# xr_disarm [ZMOD_REARM]: remove armed; if bootcmd is ours restore it: zmod's armed bootcmd when
+# xr_disarm [ZMOD_REARM]: remove armed; if bootcmd is ours (xr_is_ours) restore it: zmod's armed bootcmd when
 # ZMOD_REARM=1 (zmod's own one-shot boot continues), else the stock one
 xr_disarm() {
     rm -f "$XR_STATE/armed"
     sync
-    if [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
+    if xr_is_ours "$(xr_getenv bootcmd)"; then
         if [ "$1" = 1 ]; then
             fw_setenv bootcmd "$ARMED_BOOTCMD"
         else
@@ -311,7 +328,7 @@ xr_zmod_edits() {
         return 0
     fi
     if [ "$_xr_bc" = "$STOCK_BOOTCMD" ]; then echo; return 0; fi
-    if [ "$_xr_bc" = "$xr_bootcmd" ]; then XR_REASON=already_armed; return 1; fi
+    if xr_is_ours "$_xr_bc"; then XR_REASON=already_armed; return 1; fi
     XR_REASON=unknown_bootcmd
     return 1
 }
@@ -347,6 +364,23 @@ xr_zmod_wait() {
         [ "$_xr_el" -ge "$_xr_to" ] && return 1
         sleep "$_xr_st"
         _xr_el=$((_xr_el + _xr_st))
+    done
+}
+
+# xr_uptime_wait: return once the system has been up for XR_ARM_DELAY seconds (sleeping the rest). The
+# time slept here is a lower bound of the uptime, so an unreadable XR_UPTIME costs one full delay, never more.
+xr_uptime_wait() {
+    _xr_d=$XR_ARM_DELAY
+    case "$_xr_d" in ''|*[!0-9]*) _xr_d=180 ;; esac
+    _xr_sl=0
+    while :; do
+        _xr_up=""; [ -r "$XR_UPTIME" ] && read -r _xr_up _xr_x < "$XR_UPTIME"
+        _xr_up=${_xr_up%%.*}
+        case "$_xr_up" in ''|*[!0-9]*) _xr_up=0 ;; esac
+        [ "$_xr_up" -lt "$_xr_sl" ] && _xr_up=$_xr_sl
+        [ "$_xr_up" -ge "$_xr_d" ] && return 0
+        sleep $((_xr_d - _xr_up))
+        _xr_sl=$((_xr_sl + _xr_d - _xr_up))
     done
 }
 

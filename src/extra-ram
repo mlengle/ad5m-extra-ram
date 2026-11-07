@@ -1,6 +1,6 @@
 #!/bin/sh
 # extra-ram: frees the DSP/OP-TEE memory reservations of the AD5M through a one-shot U-Boot boot.
-# Subcommands: install, check (read-only report), test (memory self-test), uninstall, boot (init hook, run by S45xram), arm-wait (arming on zmod, after zmod's emmc.sh).
+# Subcommands: install, check (read-only report), test (memory self-test), uninstall, boot (init hook, run by S45xram), arm-wait (background arming: after zmod's emmc.sh and XR_ARM_DELAY seconds of uptime).
 #
 # State files in $XR_STATE: installed (platform=, experimental=, zm_* baseline, version=), state (ok|fail|empty),
 # fails (consecutive boots that did not reach the system), armed (exists = we armed the next boot),
@@ -52,11 +52,14 @@ xr_fail() {
 # --- boot hook steps ---
 
 # Emergency: an xram_on boot without the TEE_RAM reservation, Linux may overwrite OP-TEE. Runs on every
-# call of the hook, before anything else; the only action is a reboot with the stock bootcmd.
+# call of the hook, before anything else and even without $XR_STATE/installed (a no-op without xram_on);
+# the only action is a reboot with the stock bootcmd. busybox init may defer SIGTERM while rcS runs, so a
+# plain reboot is followed by a forced one.
 xr_safety() {
     grep -qw xram_on "$XR_CMDLINE" 2>/dev/null || return 0
     xr_verify
     [ "$XR_TEE" = missing ] || return 0
+    mkdir -p "$XR_STATE" 2>/dev/null    # may be missing: the check runs without an installation too
     xr_put state fail
     xr_put last tee_missing
     rm -f "$XR_STATE/armed"
@@ -67,6 +70,8 @@ xr_safety() {
     fi
     sync
     reboot
+    sleep 5
+    reboot -f
     exit 0
 }
 
@@ -141,11 +146,12 @@ xr_arm_now() {
     fi
     _xr_rearm=""
     if [ "$(xr_platform)" = zmod ]; then
-        if [ "$XR_REARM_OURS" = 1 ] && [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
-            # re-arm with the edits of the previous arming, but only while zmod's eMMC state is still ok
+        if [ "$XR_REARM_OURS" = 1 ] && xr_is_ours "$(xr_getenv bootcmd)"; then
+            # re-arm with the edits of the previous arming, but only while zmod's eMMC state is still ok;
+            # otherwise give back the stock bootcmd: zmod's own first-run path then arms its eMMC test
             xr_edits_of_armed
             if [ -n "$XR_EDITS" ] && [ "$ZM_STATE" != ok ]; then
-                xr_disarm 1
+                xr_disarm
                 xr_put last zmod_emmc_testing
                 xr_say "не взводится: zmod_emmc_testing" "not armed: zmod_emmc_testing"
                 return 1
@@ -160,7 +166,7 @@ xr_arm_now() {
     else
         XR_EDITS=""
         _xr_bc=$(xr_getenv bootcmd)
-        if [ "$_xr_bc" != "$STOCK_BOOTCMD" ] && [ "$_xr_bc" != "$xr_bootcmd" ]; then
+        if [ "$_xr_bc" != "$STOCK_BOOTCMD" ] && ! xr_is_ours "$_xr_bc"; then
             xr_put last unknown_bootcmd
             xr_say "неизвестный bootcmd, режим не взводится: $_xr_bc" "unknown bootcmd, mode not armed: $_xr_bc"
             return 1
@@ -220,20 +226,22 @@ xr_decide() {
             return 0
         fi
     done
+    # arming happens in the background: on zmod after its emmc.sh (it runs later and rewrites bootcmd), on
+    # every platform only once the system has been up for XR_ARM_DELAY seconds, so a boot that hangs early
+    # leaves the stock bootcmd behind
     if [ "$_xr_p" = zmod ]; then
-        # zmod's emmc.sh runs later and rewrites bootcmd: arm only after it has finished
         xr_put last waiting_zmod
-        xr_spawn_arm_wait
-        return 0
+    else
+        xr_put last waiting_uptime
     fi
-    xr_arm_now
+    xr_spawn_arm_wait
     return 0
 }
 
 # extra-ram boot: synchronous, fast; S45xram runs it on every boot
 xr_cmd_boot() {
-    [ -f "$XR_STATE/installed" ] || return 0
     xr_safety
+    [ -f "$XR_STATE/installed" ] || return 0
     _xr_id=$(cat "$XR_BOOTID" 2>/dev/null)
     if [ -n "$_xr_id" ] && [ "$(xr_get boot_id)" = "$_xr_id" ]; then
         return 0
@@ -244,7 +252,8 @@ xr_cmd_boot() {
     return 0
 }
 
-# extra-ram arm-wait: wait for zmod's emmc.sh of this boot, then arm with its eMMC edits
+# extra-ram arm-wait: wait for zmod's emmc.sh of this boot (on zmod) and for an uptime of XR_ARM_DELAY
+# seconds, then arm (on zmod with its eMMC edits)
 xr_cmd_arm_wait() {
     [ -f "$XR_STATE/installed" ] || return 0
     [ "$(xr_get state)" = fail ] && return 0
@@ -254,6 +263,7 @@ xr_cmd_arm_wait() {
             "zmod emmc.sh did not finish in 15 minutes (eMMC test running?), not armed this boot"
         return 0
     fi
+    xr_uptime_wait
     # uninstall or a failure may have happened while waiting
     [ -f "$XR_STATE/installed" ] || return 0
     [ "$(xr_get state)" = fail ] && return 0
@@ -321,9 +331,11 @@ xr_cmd_install() {
     _xi_p=$(xr_platform)
     if [ "$_xi_p" = zmod ]; then
         _xi_exp=0
-        if xr_zmod_running; then
-            xr_refuse "zmod ещё выполняет emmc.sh после загрузки, повторите через несколько минут" \
-                "zmod is still running emmc.sh after the boot, try again in a few minutes"
+        # zmod's emmc.sh must have finished in this boot: arming before it ran would leave a bootcmd it does
+        # not know (it then exits without clearing its armed.txt and counts a failed boot next time)
+        if ! xr_zmod_wait 0; then
+            xr_refuse "zmod ещё не закончил проверку eMMC (emmc.sh) в этой загрузке, повторите через несколько минут" \
+                "zmod has not finished its eMMC check (emmc.sh) for this boot, try again in a few minutes"
         fi
     elif [ "$_xi_exp" != 1 ]; then
         xr_refuse "поддерживается только zmod (найдено: $_xi_p); для рутованной стоковой прошивки и Forge-X есть экспериментальная установка (флаг --experimental), она не проверялась на принтере" \
@@ -345,15 +357,14 @@ xr_cmd_install() {
             "the firmware is not in the verified list ($XR_FWINFO). Please send this to the author to get the firmware added"
     fi
     _xi_bc=$(xr_getenv bootcmd)
-    if [ "$_xi_bc" != "$STOCK_BOOTCMD" ] && [ "$_xi_bc" != "$xr_bootcmd" ] &&
+    if [ "$_xi_bc" != "$STOCK_BOOTCMD" ] && ! xr_is_ours "$_xi_bc" &&
         { [ "$_xi_p" != zmod ] || [ "$_xi_bc" != "$ARMED_BOOTCMD" ]; }; then
         xr_refuse "неизвестный bootcmd: $_xi_bc" "unknown bootcmd: $_xi_bc"
     fi
-    case "$_xi_bc" in
-    "$STOCK_BOOTCMD") _xi_bk=stock ;;
-    "$xr_bootcmd") _xi_bk=extra-ram ;;
-    *) _xi_bk=zmod-armed ;;
-    esac
+    if [ "$_xi_bc" = "$STOCK_BOOTCMD" ]; then _xi_bk=stock
+    elif xr_is_ours "$_xi_bc"; then _xi_bk=extra-ram
+    else _xi_bk=zmod-armed
+    fi
     xr_write_probe || xr_refuse "не удаётся записать в $XR_STATE (нет места или файловая система только для чтения)" \
         "cannot write to $XR_STATE (no space or a read-only filesystem)"
 
@@ -385,6 +396,8 @@ xr_cmd_install() {
     [ "$(xr_get state)" = fail ] && rm -f "$XR_STATE/state"
     xr_put fails 0
 
+    # a background arm-wait of this boot must not arm again after us
+    xr_stop_arm_wait
     XR_FW_CHECKED=1 XR_REARM_OURS=1 xr_arm_now
     if [ $? -eq 0 ]; then
         xr_msg "Установлено. Перезагрузите принтер, затем запустите extra-ram check" \
@@ -402,8 +415,8 @@ xr_cmd_install() {
     return 0
 }
 
-# xr_stop_arm_wait: kill a running "extra-ram arm-wait" (background arming on zmod), so it cannot re-arm
-# after uninstall; own shell excluded
+# xr_stop_arm_wait: kill a running "extra-ram arm-wait" (background arming), so it cannot arm
+# after uninstall or after install armed; own shell excluded
 xr_stop_arm_wait() {
     for _xu_d in "$XR_PROC"/[0-9]*; do
         _xu_n=${_xu_d##*/}
@@ -429,12 +442,18 @@ xr_cmd_uninstall() {
         xr_edits_of_armed
         if [ -n "$XR_EDITS" ] && [ "$ZM_STATE" = ok ] && [ -n "$(xr_getenv boot_zmod)" ]; then _xu_rearm=1; fi
     fi
+    _xu_armed=0; [ -f "$XR_STATE/armed" ] && _xu_armed=1
     xr_disarm $_xu_rearm
-    if [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
-        # restore failed: still armed, keep the failure accounting working, remove nothing
-        touch "$XR_STATE/armed" 2>/dev/null
-        xr_msg "extra-ram: не удалось вернуть bootcmd, ничего не удалено; повторите extra-ram uninstall" \
-            "extra-ram: failed to restore bootcmd, nothing was removed; run extra-ram uninstall again"
+    # the variables go only after a positive check: bootcmd read back and it is the stock one or zmod's armed
+    # one (a failed read or any other value could still lead to xram_main)
+    if _xu_bc=$(fw_printenv -n bootcmd 2>/dev/null) &&
+        { [ "$_xu_bc" = "$STOCK_BOOTCMD" ] || [ "$_xu_bc" = "$ARMED_BOOTCMD" ]; }; then
+        :
+    else
+        # keep everything: if still armed, the failure accounting keeps working
+        { [ "$_xu_armed" = 1 ] || xr_is_ours "$_xu_bc"; } && touch "$XR_STATE/armed" 2>/dev/null
+        xr_msg "extra-ram: не удалось вернуть и проверить bootcmd (сейчас: ${_xu_bc:-не прочитан}), ничего не удалено; повторите extra-ram uninstall" \
+            "extra-ram: failed to restore and verify bootcmd (now: ${_xu_bc:-unreadable}), nothing was removed; run extra-ram uninstall again"
         return 1
     fi
     xr_env_remove
@@ -464,6 +483,8 @@ xc_reason() {
         "the mode is armed for the next boot, reboot the printer" ;;
     armed_failed) xr_msg "ошибка взвода (окружение U-Boot или $XR_STATE, см. $XR_STATE/extra-ram.log), запустите extra-ram install ещё раз" \
         "arming failed (U-Boot environment or $XR_STATE, see $XR_STATE/extra-ram.log), run extra-ram install again" ;;
+    waiting_uptime) xr_msg "идёт ожидание: режим взводится через $XR_ARM_DELAY с после загрузки (повторите check через несколько минут)" \
+        "waiting: the mode is armed $XR_ARM_DELAY s after the boot (run check again in a few minutes)" ;;
     waiting_zmod) xr_msg "идёт ожидание: режим взводится после того, как zmod закончит emmc.sh этой загрузки (повторите check через несколько минут)" \
         "waiting: the mode is armed after zmod has finished emmc.sh of this boot (run check again in a few minutes)" ;;
     safe_mode) xr_msg "безопасный режим Forge-X, режим не взводится" "Forge-X safe mode, the mode is not armed" ;;
@@ -581,7 +602,7 @@ xr_cmd_check() {
     fi
     xc_extra_ram
     xc_zmod
-    if [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
+    if xr_is_ours "$(xr_getenv bootcmd)"; then
         xr_msg "Взведён на следующую загрузку: да" "Armed for the next boot: yes"
     elif [ "$XC_LAST_SHOWN" = 0 ] && [ -n "$_xc_last" ] && [ "$_xc_last" != active ]; then
         # the line above is "active": say why the next boot is not armed
