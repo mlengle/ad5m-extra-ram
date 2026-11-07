@@ -11,6 +11,8 @@ mkdir -p "$D" || exit 1
 L=$D/cpu1multi-$(cut -c1-8 "$XR_BOOTID").log
 H=$(cat "$D/harvest.pid" 2>/dev/null)
 log(){ echo "$(date +%T) $*" >> "$L"; sync; }
+# terminated mid-round (selftest.sh cleanup sends TERM): never leave the second core offline
+trap 'echo 1 > "$XR_CPUDIR/cpu1/online"; log "interrupted, cpu1 -> 1"; exit 1' TERM HUP INT
 for i in 1 2 3; do
   log "round $i off"; echo 0 > "$XR_CPUDIR/cpu1/online"; log "round $i offline=$(cat "$XR_CPUDIR/online")"
   sleep 3

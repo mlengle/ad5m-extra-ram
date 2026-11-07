@@ -14,7 +14,9 @@ D=$XR_TESTDIR
 mkdir -p "$D" || exit 1
 L=$D/cpu1test-$(cut -c1-8 "$XR_BOOTID").log
 log(){ echo "$(date +%T) $*" >> "$L"; sync; }
-S=$(wc -l < "$XR_MESSAGES" 2>/dev/null || echo 0)
+# terminated mid-round (selftest.sh cleanup sends TERM): never leave the second core offline
+trap 'echo 1 > "$XR_CPUDIR/cpu1/online"; log "interrupted, cpu1 -> 1"; exit 1' TERM HUP INT
+S=$({ wc -l < "$XR_MESSAGES"; } 2>/dev/null || echo 0)
 log "start nodsp=$(grep -cwE "xram_on|zmod_nodsp|zmod_mem" "$XR_CMDLINE") memtotal=$(awk "/MemTotal/{print \$2}" "$XR_MEMINFO") online=$(cat "$XR_CPUDIR/online")"
 log "cpu1 -> 0"
 echo 0 > "$XR_CPUDIR/cpu1/online"

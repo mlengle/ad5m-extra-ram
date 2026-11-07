@@ -622,8 +622,8 @@ xr_cmd_test() {
     [ -x "$XR_PYTHON" ] || xr_refuse "нет $XR_PYTHON (python3 нужен тесту памяти)" \
         "$XR_PYTHON not found (the memory test needs python3)"
     [ -f "$XR_SELFTEST" ] || xr_refuse "нет скрипта теста: $XR_SELFTEST" "the self-test script is missing: $XR_SELFTEST"
-    _xt_st=$(xr_print_state)
-    if xr_printing; then
+    _xt_st=$(xr_print_state)   # one Moonraker query decides both checks below
+    if xr_state_busy "$_xt_st"; then
         xr_refuse "принтер печатает (Moonraker: $_xt_st), повторите после печати" \
             "the printer is printing (Moonraker: $_xt_st), try again when it is idle"
     fi
@@ -633,6 +633,24 @@ xr_cmd_test() {
     fi
     xr_msg "Тест памяти займёт около 11 минут, принтер всё это время должен простаивать (не запускайте печать). Если принтер зависнет, выключите и включите питание и пришлите вывод extra-ram check автору. Результат: последняя строка RESULT PASS или RESULT FAIL, журналы: $XR_TESTDIR" \
         "The memory test takes about 11 minutes, keep the printer idle meanwhile (do not start a print). If the printer freezes, power-cycle it and send the output of extra-ram check to the author. Result: the last line is RESULT PASS or RESULT FAIL, logs: $XR_TESTDIR"
+    # one run at a time: lock file with our pid; a lock whose pid is gone (or is not an extra-ram test process) is stale
+    mkdir -p "$XR_TESTDIR" 2>/dev/null
+    _xt_lock=$XR_TESTDIR/test.lock
+    _xt_try=0
+    until ( set -C; echo $$ > "$_xt_lock" ) 2>/dev/null; do
+        _xt_pid=""
+        read -r _xt_pid < "$_xt_lock" 2>/dev/null
+        case "$_xt_pid" in ''|*[!0-9]*) _xt_pid=0 ;; esac
+        if [ "$_xt_pid" != 0 ] && kill -0 "$_xt_pid" 2>/dev/null &&
+            tr '\0' ' ' < "/proc/$_xt_pid/cmdline" 2>/dev/null | grep -q 'extra-ram test'; then
+            xr_refuse "тест уже выполняется (pid $_xt_pid, $_xt_lock)" "a test is already running (pid $_xt_pid, $_xt_lock)"
+        fi
+        _xt_try=$((_xt_try + 1))
+        [ "$_xt_try" -le 3 ] || xr_refuse "не удалось создать $_xt_lock" "cannot create $_xt_lock"
+        rm -f "$_xt_lock"
+    done
+    trap 'rm -f "$_xt_lock"' EXIT
+    trap 'rm -f "$_xt_lock"; exit 1' INT TERM HUP
     export XR_STATE XR_TESTDIR XR_PYTHON XR_CMDLINE XR_MEMINFO XR_BOOTID XR_MEMBLOCK
     _xt_out=$XR_TMP/extra-ram-test.$$
     sh "$XR_SELFTEST" 2>&1 | tee "$_xt_out"

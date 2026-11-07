@@ -76,7 +76,11 @@ xr_print_state() {
 # xr_printing: succeeds when the printer is busy (any state but standby/complete/cancelled/error);
 # unreachable Moonraker counts as idle
 xr_printing() {
-    case "$(xr_print_state)" in
+    xr_state_busy "$(xr_print_state)"
+}
+# xr_state_busy STATE: succeeds when the print_stats state STATE means busy (empty counts as idle)
+xr_state_busy() {
+    case "$1" in
     ""|standby|complete|cancelled|error) return 1 ;;
     esac
     return 0
