@@ -117,11 +117,13 @@ xr_postboot() {
 # xr_edits_of_armed: set XR_EDITS to the eMMC edits carried by the current xram_boot (none when absent)
 xr_edits_of_armed() {
     XR_EDITS=""
+    xr_zmod_state
     _xr_bv=$(xr_getenv xram_boot)
     case "$_xr_bv" in
     *"$EMMC_FDT_DDR"*) XR_EDITS=$EMMC_FDT_DDR ;;
     *"$EMMC_FDT"*) XR_EDITS=$EMMC_FDT ;;
     esac
+    return 0
 }
 
 # Arm now (no waiting): firmware check, eMMC edits on zmod, bootcmd check elsewhere, xr_arm.
@@ -140,7 +142,14 @@ xr_arm_now() {
     _xr_rearm=""
     if [ "$(xr_platform)" = zmod ]; then
         if [ "$XR_REARM_OURS" = 1 ] && [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
+            # re-arm with the edits of the previous arming, but only while zmod's eMMC state is still ok
             xr_edits_of_armed
+            if [ -n "$XR_EDITS" ] && [ "$ZM_STATE" != ok ]; then
+                xr_disarm 1
+                xr_put last zmod_emmc_testing
+                xr_say "не взводится: zmod_emmc_testing" "not armed: zmod_emmc_testing"
+                return 1
+            fi
         elif ! xr_zmod_edits >/dev/null; then
             xr_put last "$XR_REASON"
             xr_say "не взводится: $XR_REASON" "not armed: $XR_REASON"
@@ -373,10 +382,8 @@ xr_cmd_install() {
         xr_installed_write "$_xi_p" "$_xi_exp"
     fi || { xr_msg "extra-ram: не удалось записать $XR_STATE/installed" "extra-ram: cannot write $XR_STATE/installed"; exit 1; }
     # install is the only way to re-enable the mode after the failure limit
-    if [ "$(xr_get state)" = fail ]; then
-        rm -f "$XR_STATE/state"
-        xr_put fails 0
-    fi
+    [ "$(xr_get state)" = fail ] && rm -f "$XR_STATE/state"
+    xr_put fails 0
 
     XR_FW_CHECKED=1 XR_REARM_OURS=1 xr_arm_now
     if [ $? -eq 0 ]; then
@@ -395,26 +402,45 @@ xr_cmd_install() {
     return 0
 }
 
+# xr_stop_arm_wait: kill a running "extra-ram arm-wait" (background arming on zmod), so it cannot re-arm
+# after uninstall; own shell excluded
+xr_stop_arm_wait() {
+    for _xu_d in "$XR_PROC"/[0-9]*; do
+        _xu_n=${_xu_d##*/}
+        [ "$_xu_n" = "$$" ] && continue
+        [ -r "$_xu_d/cmdline" ] || continue
+        _xu_c=$(tr '\0' ' ' < "$_xu_d/cmdline" 2>/dev/null)
+        case "$_xu_c" in
+        *"extra-ram arm-wait "*) kill "$_xu_n" 2>/dev/null ;;
+        esac
+    done
+}
+
 # extra-ram uninstall. The boot safety check only runs while $XR_STATE/installed exists, so bootcmd and the
-# xram_* variables are restored (and verified) first; only then the files go.
+# xram_* variables are restored (and verified) first; only then the files go. The variables are never removed
+# while bootcmd still points at xram_main (that would hang the next boot).
 xr_cmd_uninstall() {
     xr_is_root || xr_refuse "нужны права root (запускайте от root)" "must be run as root"
-    _xi_rearm=""
+    xr_stop_arm_wait
+    # zmod's own one-shot boot is given back only when zmod had armed under us: our xram_boot carries its eMMC
+    # edits, zmod's eMMC state is ok and boot_zmod exists
+    _xu_rearm=""
     if [ "$(xr_platform)" = zmod ]; then
-        xr_zmod_state
-        # zmod's own one-shot boot continues only while it has something to boot
-        if [ "$ZM_STATE" = ok ] && [ -n "$(xr_getenv boot_zmod)" ]; then _xi_rearm=1; fi
+        xr_edits_of_armed
+        if [ -n "$XR_EDITS" ] && [ "$ZM_STATE" = ok ] && [ -n "$(xr_getenv boot_zmod)" ]; then _xu_rearm=1; fi
     fi
-    xr_disarm $_xi_rearm
+    xr_disarm $_xu_rearm
+    if [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
+        # restore failed: still armed, keep the failure accounting working, remove nothing
+        touch "$XR_STATE/armed" 2>/dev/null
+        xr_msg "extra-ram: не удалось вернуть bootcmd, ничего не удалено; повторите extra-ram uninstall" \
+            "extra-ram: failed to restore bootcmd, nothing was removed; run extra-ram uninstall again"
+        return 1
+    fi
     xr_env_remove
-    _xi_ok=0
-    if _xi_all=$(fw_printenv 2>/dev/null) && [ "$(xr_getenv bootcmd)" != "$xr_bootcmd" ] &&
-        ! echo "$_xi_all" | grep -q '^xram_'; then
-        _xi_ok=1
-    fi
-    if [ "$_xi_ok" != 1 ]; then
-        # still armed: keep the failure accounting working
-        [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ] && touch "$XR_STATE/armed" 2>/dev/null
+    if _xu_all=$(fw_printenv 2>/dev/null) && ! echo "$_xu_all" | grep -q '^xram_'; then
+        :
+    else
         xr_msg "extra-ram: ошибка записи окружения U-Boot, ничего не удалено; повторите extra-ram uninstall" \
             "extra-ram: failed to write the U-Boot environment, nothing was removed; run extra-ram uninstall again"
         return 1
