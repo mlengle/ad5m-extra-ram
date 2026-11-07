@@ -119,14 +119,17 @@ xr_postboot() {
     sync
 }
 
-# xr_edits_of_armed: set XR_EDITS to the eMMC edits carried by the current xram_boot (none when absent)
+# xr_edits_of_armed: set XR_EDITS to the eMMC edits carried by the current xram_boot, exactly as xr_env_values
+# put them there (whatever zmod variant they came from); none when xram_boot is absent or not in our format
 xr_edits_of_armed() {
     XR_EDITS=""
     xr_zmod_state
     _xr_bv=$(xr_getenv xram_boot)
     case "$_xr_bv" in
-    *"$EMMC_FDT_DDR"*) XR_EDITS=$EMMC_FDT_DDR ;;
-    *"$EMMC_FDT"*) XR_EDITS=$EMMC_FDT ;;
+    "fdt addr 0x44864e70;fdt resize;"*";$XR_BOOTM")
+        XR_EDITS=${_xr_bv#"fdt addr 0x44864e70;fdt resize;"}
+        XR_EDITS=${XR_EDITS%";$XR_BOOTM"}
+        ;;
     esac
     return 0
 }
@@ -357,8 +360,11 @@ xr_cmd_install() {
             "the firmware is not in the verified list ($XR_FWINFO). Please send this to the author to get the firmware added"
     fi
     _xi_bc=$(xr_getenv bootcmd)
-    if [ "$_xi_bc" != "$STOCK_BOOTCMD" ] && ! xr_is_ours "$_xi_bc" &&
-        { [ "$_xi_p" != zmod ] || [ "$_xi_bc" != "$ARMED_BOOTCMD" ]; }; then
+    if [ "$_xi_p" = zmod ] && [ "$_xi_bc" != "$STOCK_BOOTCMD" ] && ! xr_is_ours "$_xi_bc" &&
+        ! xr_zmod_find "$_xi_bc" "$(xr_getenv boot_zmod)"; then
+        xr_refuse "$(xc_reason_zmod_unknown ru) (bootcmd: $_xi_bc)" "$(xc_reason_zmod_unknown en) (bootcmd: $_xi_bc)"
+    fi
+    if [ "$_xi_p" != zmod ] && [ "$_xi_bc" != "$STOCK_BOOTCMD" ] && ! xr_is_ours "$_xi_bc"; then
         xr_refuse "неизвестный bootcmd: $_xi_bc" "unknown bootcmd: $_xi_bc"
     fi
     if [ "$_xi_bc" = "$STOCK_BOOTCMD" ]; then _xi_bk=stock
@@ -447,7 +453,7 @@ xr_cmd_uninstall() {
     # the variables go only after a positive check: bootcmd read back and it is the stock one or zmod's armed
     # one (a failed read or any other value could still lead to xram_main)
     if _xu_bc=$(fw_printenv -n bootcmd 2>/dev/null) &&
-        { [ "$_xu_bc" = "$STOCK_BOOTCMD" ] || [ "$_xu_bc" = "$ARMED_BOOTCMD" ]; }; then
+        { [ "$_xu_bc" = "$STOCK_BOOTCMD" ] || xr_zmod_find "$_xu_bc" "*"; }; then
         :
     else
         # keep everything: if still armed, the failure accounting keeps working
@@ -473,6 +479,15 @@ xr_cmd_uninstall() {
 }
 
 # --- check ---
+
+# xc_reason_zmod_unknown ru|en: the explanation for a zmod version extra-ram does not know (no trailing period)
+xc_reason_zmod_unknown() {
+    if [ "$1" = ru ]; then
+        echo "эта версия zmod неизвестна extra-ram (строки взвода eMMC в emmc.sh не из списка, md5 emmc.sh: $(xr_zmod_id)), режим не взводится; обновите extra-ram или пришлите вывод check автору"
+    else
+        echo "this zmod version is unknown to extra-ram (the eMMC arming strings of emmc.sh are not in the list, emmc.sh md5: $(xr_zmod_id)), the mode is not armed; update extra-ram or send the output of check to the author"
+    fi
+}
 
 # xc_reason CODE: print the explanation of a "last" reason code (why the mode is not active / not armed)
 xc_reason() {
@@ -503,8 +518,7 @@ xc_reason() {
             "the firmware is not in the verified list ($XR_FWINFO). Please send this to the author to get the firmware added" ;;
     zmod_emmc_testing) xr_msg "zmod сейчас проверяет 50 МГц (state.txt не ok): режим не взводится, чтобы не смешивать сбои; взведётся после проверки" \
         "zmod is testing eMMC 50 MHz now (state.txt is not ok): not armed so the failures do not mix; it is armed after the test" ;;
-    zmod_unknown_boot_zmod) xr_msg "boot_zmod в zmod не из известных строк (новая версия zmod?), режим не взводится; пришлите вывод check автору" \
-        "zmod's boot_zmod is not one of the known strings (new zmod version?), not armed; send the output of check to the author" ;;
+    zmod_unknown_boot_zmod|zmod_unknown_bootcmd) xr_msg "$(xc_reason_zmod_unknown ru)" "$(xc_reason_zmod_unknown en)" ;;
     zmod_wait_timeout) xr_msg "zmod emmc.sh не закончил за 15 минут (идёт тест eMMC?), в ту загрузку режим не взведён" \
         "zmod emmc.sh did not finish in 15 minutes (eMMC test running?), not armed in that boot" ;;
     platform_changed) xr_msg "система сменилась (при установке: $(xr_inst platform), сейчас: $(xr_platform)), режим не взводится; переустановите zmod или extra-ram с флагом --experimental" \

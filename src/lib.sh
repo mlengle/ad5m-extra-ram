@@ -34,14 +34,46 @@
 XR_KNOWN='c4aabbae50d6f56c8db2109804456ed2 e82291d2 5ed6ffabbadb9926c7d44a9b4b833683'
 XR_PKG_SECTORS="32800 24576"
 
-# --- zmod 1.7 strings (.shell/emmc.sh of branch 1.7), copied verbatim ---
+# --- stock firmware strings (also used by zmod's .shell/emmc.sh) ---
 STOCK_BOOTCMD='run setargs_mmc boot_dsp0 boot_uImage'
+BOOT_UIMAGE='part list mmc 0;fatload mmc 0:1 0x43000000 uImage;fatload mmc 0:1 0x44864e70 sunxi.dtb;fdt resize;bootm 0x43000000 - 0x44864e70'
+
+# --- zmod 1.7 strings (.shell/emmc.sh of branch 1.7, md5 ecbec3488c29293e5a87ae3c0d510bd5), copied verbatim ---
 ARMED_BOOTCMD='setenv bootcmd run setargs_mmc boot_dsp0 boot_uImage;saveenv;run setargs_mmc boot_dsp0 boot_zmod'
 EMMC_FDT='fdt rm /soc@3000000/sdmmc@4020000 mmc-hs200-1_8v;fdt rm /soc@3000000/sdmmc@4020000 mmc-ddr-1_8v;fdt set /soc@3000000/sdmmc@4020000 max-frequency <0x2faf080>;setenv bootargs ${bootargs} zmod_emmc_50'
 BOOT_ZMOD_B="part list mmc 0;fatload mmc 0:1 0x43000000 uImage;fatload mmc 0:1 0x44864e70 sunxi.dtb;fdt addr 0x44864e70;fdt resize;${EMMC_FDT};bootm 0x43000000 - 0x44864e70"
 EMMC_FDT_DDR='fdt rm /soc@3000000/sdmmc@4020000 mmc-hs200-1_8v;fdt set /soc@3000000/sdmmc@4020000 max-frequency <0x2faf080>;setenv bootargs ${bootargs} zmod_emmc_ddr'
 BOOT_ZMOD_B_DDR="part list mmc 0;fatload mmc 0:1 0x43000000 uImage;fatload mmc 0:1 0x44864e70 sunxi.dtb;fdt addr 0x44864e70;fdt resize;${EMMC_FDT_DDR};bootm 0x43000000 - 0x44864e70"
-BOOT_UIMAGE='part list mmc 0;fatload mmc 0:1 0x43000000 uImage;fatload mmc 0:1 0x44864e70 sunxi.dtb;fdt resize;bootm 0x43000000 - 0x44864e70'
+
+# --- known zmod eMMC variants: one line per variant, fields separated by "|":
+#     zmod's armed bootcmd | the eMMC edits (copied into our xram_boot) | zmod's boot_zmod
+# Only exact matches count: an unknown variant (a new zmod version) is never armed, and zmod's armed
+# bootcmd is given back only when the current boot_zmod is in this table. To support a new zmod version,
+# add its lines (verbatim from its .shell/emmc.sh) and run the bench.
+: ${XR_ZMOD_KNOWN:="$ARMED_BOOTCMD|$EMMC_FDT|$BOOT_ZMOD_B
+$ARMED_BOOTCMD|$EMMC_FDT_DDR|$BOOT_ZMOD_B_DDR"}
+
+# xr_zmod_find ARMED BOOT_ZMOD: find a known zmod variant whose armed bootcmd is ARMED and whose boot_zmod is
+# BOOT_ZMOD; either argument may be "*" (any). Sets XZ_ARMED, XZ_EDITS, XZ_BOOT of the first match and
+# succeeds; clears them and returns 1 when nothing matches. An empty argument never matches.
+xr_zmod_find() {
+    while IFS='|' read -r XZ_ARMED XZ_EDITS XZ_BOOT; do
+        [ -n "$XZ_ARMED" ] || continue
+        if { [ "$1" = "*" ] || [ "$1" = "$XZ_ARMED" ]; } && { [ "$2" = "*" ] || [ "$2" = "$XZ_BOOT" ]; }; then
+            return 0
+        fi
+    done <<XR_EOF
+$XR_ZMOD_KNOWN
+XR_EOF
+    XZ_ARMED=""; XZ_EDITS=""; XZ_BOOT=""
+    return 1
+}
+
+# xr_zmod_id: md5 of zmod's emmc.sh (identifies the zmod version in messages), "none" without it
+xr_zmod_id() {
+    _xr_zi=$(md5sum < "$XR_ZMOD_SH" 2>/dev/null | cut -d' ' -f1)
+    echo "${_xr_zi:-none}"
+}
 
 # --- messages ---
 # xr_msg RU EN: print the message in the selected language (XRAM_LANG=ru|en, else zmod's lang.cfg, else English)
@@ -249,7 +281,7 @@ xr_arm() {
     fi
     rm -f "$XR_STATE/armed"
     if [ "$(xr_getenv bootcmd)" != "$_xr_bc0" ]; then
-        if [ "$_xr_bc0" = "$STOCK_BOOTCMD" ] || [ "$_xr_bc0" = "$ARMED_BOOTCMD" ]; then
+        if [ "$_xr_bc0" = "$STOCK_BOOTCMD" ] || xr_zmod_find "$_xr_bc0" "*"; then
             fw_setenv bootcmd "$_xr_bc0"
         else
             fw_setenv bootcmd "$STOCK_BOOTCMD"
@@ -258,14 +290,16 @@ xr_arm() {
     return 1
 }
 
-# xr_disarm [ZMOD_REARM]: remove armed; if bootcmd is ours (xr_is_ours) restore it: zmod's armed bootcmd when
-# ZMOD_REARM=1 (zmod's own one-shot boot continues), else the stock one
+# xr_disarm [ZMOD_REARM]: remove armed; if bootcmd is ours (xr_is_ours) restore it: with ZMOD_REARM=1 zmod's
+# armed bootcmd of the variant whose boot_zmod is the current one (zmod's own one-shot boot continues), else
+# (or when boot_zmod is not a known variant, e.g. zmod was updated: its armed bootcmd may run a variable that
+# no longer exists, and a failed run hangs the vendor U-Boot) the stock one
 xr_disarm() {
     rm -f "$XR_STATE/armed"
     sync
     if xr_is_ours "$(xr_getenv bootcmd)"; then
-        if [ "$1" = 1 ]; then
-            fw_setenv bootcmd "$ARMED_BOOTCMD"
+        if [ "$1" = 1 ] && xr_zmod_find "*" "$(xr_getenv boot_zmod)"; then
+            fw_setenv bootcmd "$XZ_ARMED"
         else
             fw_setenv bootcmd "$STOCK_BOOTCMD"
         fi
@@ -317,19 +351,20 @@ xr_zmod_edits() {
     XR_EDITS=""; XR_REASON=""
     xr_zmod_state
     _xr_bc=$(xr_getenv bootcmd)
-    if [ "$_xr_bc" = "$ARMED_BOOTCMD" ]; then
+    if xr_zmod_find "$_xr_bc" "*"; then
         if [ "$ZM_STATE" != ok ]; then XR_REASON=zmod_emmc_testing; return 1; fi
-        _xr_bz=$(xr_getenv boot_zmod)
-        if [ "$_xr_bz" = "$BOOT_ZMOD_B" ]; then XR_EDITS=$EMMC_FDT
-        elif [ "$_xr_bz" = "$BOOT_ZMOD_B_DDR" ]; then XR_EDITS=$EMMC_FDT_DDR
-        else XR_REASON=zmod_unknown_boot_zmod; return 1
+        if xr_zmod_find "$_xr_bc" "$(xr_getenv boot_zmod)"; then
+            XR_EDITS=$XZ_EDITS
+        else
+            XR_REASON=zmod_unknown_boot_zmod; return 1
         fi
         printf '%s\n' "$XR_EDITS"
         return 0
     fi
     if [ "$_xr_bc" = "$STOCK_BOOTCMD" ]; then echo; return 0; fi
     if xr_is_ours "$_xr_bc"; then XR_REASON=already_armed; return 1; fi
-    XR_REASON=unknown_bootcmd
+    # on zmod an unknown bootcmd is most likely the armed bootcmd of a zmod version we do not know
+    XR_REASON=zmod_unknown_bootcmd
     return 1
 }
 
