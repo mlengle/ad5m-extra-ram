@@ -305,9 +305,13 @@ xr_zmod_running() {
 
 # xr_zmod_wait [TIMEOUT]: wait (default 900 s, poll every XR_WAIT_STEP s) until zmod's emmc.sh has finished
 # this boot: boot_id.txt equals the current boot id AND no emmc.sh process is left (boot_id.txt is written
-# early in the run, before arming). Returns 0 at once without zmod; 1 on timeout.
+# early in the run, before arming). Returns 0 at once without zmod or with disable.txt; 1 on timeout.
 xr_zmod_wait() {
     [ -e "$XR_ZMOD_SH" ] || return 0
+    # disable.txt: zmod's emmc.sh exits at that branch before it writes boot_id.txt, so waiting would always
+    # time out; there it rewrites bootcmd only when it equals zmod's own ARMED_BOOTCMD, so it can never
+    # overwrite ours whatever the timing.
+    [ -e "$XR_ZMOD_EMMC/disable.txt" ] && return 0
     _xr_to=${1:-900}; _xr_el=0; _xr_st=$XR_WAIT_STEP
     case "$_xr_to" in ""|*[!0-9]*) _xr_to=900 ;; esac
     case "$_xr_st" in ''|*[!0-9]*|0) _xr_st=5 ;; esac
