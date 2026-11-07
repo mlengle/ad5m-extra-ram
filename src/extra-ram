@@ -1,6 +1,6 @@
 #!/bin/sh
 # extra-ram: frees the DSP/OP-TEE memory reservations of the AD5M through a one-shot U-Boot boot.
-# Subcommands: boot (init hook, run by S45xram), arm-wait (arming on zmod, after zmod's emmc.sh).
+# Subcommands: install, uninstall, boot (init hook, run by S45xram), arm-wait (arming on zmod, after zmod's emmc.sh).
 #
 # State files in $XR_STATE: installed (platform=, experimental=, zm_* baseline, version=), state (ok|fail|empty),
 # fails (consecutive boots that did not reach the system), armed (exists = we armed the next boot),
@@ -114,10 +114,23 @@ xr_postboot() {
     sync
 }
 
+# xr_edits_of_armed: set XR_EDITS to the eMMC edits carried by the current xram_boot (none when absent)
+xr_edits_of_armed() {
+    XR_EDITS=""
+    _xr_bv=$(xr_getenv xram_boot)
+    case "$_xr_bv" in
+    *"$EMMC_FDT_DDR"*) XR_EDITS=$EMMC_FDT_DDR ;;
+    *"$EMMC_FDT"*) XR_EDITS=$EMMC_FDT ;;
+    esac
+}
+
 # Arm now (no waiting): firmware check, eMMC edits on zmod, bootcmd check elsewhere, xr_arm.
 # Sets last to armed or to the reason it did not arm.
+#   XR_FW_CHECKED=1: the caller has just run xr_fw_check (install), do not repeat it.
+#   XR_REARM_OURS=1: when bootcmd is already ours on zmod (install over an armed installation), arm again
+#   with the eMMC edits of the previous arming instead of refusing as already armed.
 xr_arm_now() {
-    xr_fw_check
+    [ "$XR_FW_CHECKED" = 1 ] || xr_fw_check
     if [ "$XR_FW" != ok ]; then
         xr_put last firmware_unknown
         xr_say "прошивка не из списка проверенных, режим не взводится ($XR_FWINFO)" \
@@ -126,7 +139,9 @@ xr_arm_now() {
     fi
     _xr_rearm=""
     if [ "$(xr_platform)" = zmod ]; then
-        if ! xr_zmod_edits >/dev/null; then
+        if [ "$XR_REARM_OURS" = 1 ] && [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
+            xr_edits_of_armed
+        elif ! xr_zmod_edits >/dev/null; then
             xr_put last "$XR_REASON"
             xr_say "не взводится: $XR_REASON" "not armed: $XR_REASON"
             return 1
@@ -237,11 +252,188 @@ xr_cmd_arm_wait() {
     return 0
 }
 
+# --- install / uninstall ---
+
+# xr_refuse RU EN: print the refusal and leave with exit 1 (always before anything is changed)
+xr_refuse() {
+    xr_msg "extra-ram: отказ: $1" "extra-ram: refused: $2"
+    exit 1
+}
+
+# Succeeds when running as root (XR_UID overrides the uid for tests)
+xr_is_root() {
+    [ "${XR_UID:-$(id -u)}" = 0 ]
+}
+
+# xr_write_probe: the state directory is writable and the rootfs has room (a full rootfs would fail the
+# state writes later, after U-Boot was touched)
+xr_write_probe() {
+    mkdir -p "$XR_STATE" 2>/dev/null || return 1
+    _xi_pf=$XR_STATE/.probe
+    dd if=/dev/zero of="$_xi_pf" bs=1024 count=16 2>/dev/null && [ "$(wc -c < "$_xi_pf")" -eq 16384 ] &&
+        sync
+    _xi_pr=$?
+    rm -f "$_xi_pf"
+    return $_xi_pr
+}
+
+# xr_installed_keep PLATFORM EXPERIMENTAL: rewrite installed keeping the baseline (zm_*) of the previous installation
+xr_installed_keep() {
+    printf 'platform=%s\nexperimental=%s\nzm_state=%s\nzm_ddr=%s\nzm_disable=%s\nzm_mark=%s\nversion=1\n' \
+        "$1" "$2" "$(xr_inst zm_state)" "$(xr_inst zm_ddr)" "$(xr_inst zm_disable)" "$(xr_inst zm_mark)" \
+        > "$XR_STATE/installed.new" 2>/dev/null && mv -f "$XR_STATE/installed.new" "$XR_STATE/installed"
+}
+
+# extra-ram install [--experimental] [--yes]
+xr_cmd_install() {
+    _xi_exp=0; _xi_yes=0
+    for _xi_a in "$@"; do
+        case "$_xi_a" in
+        --experimental) _xi_exp=1 ;;
+        --yes) _xi_yes=1 ;;
+        *) xr_refuse "использование: extra-ram install [--experimental] [--yes]" \
+            "usage: extra-ram install [--experimental] [--yes]" ;;
+        esac
+    done
+    xr_is_root || xr_refuse "нужны права root (запускайте от root)" "must be run as root"
+
+    # tools: the list of everything missing at once
+    _xi_miss=""
+    for _xi_t in fw_printenv fw_setenv md5sum hexdump mount; do
+        command -v "$_xi_t" >/dev/null 2>&1 || _xi_miss="$_xi_miss $_xi_t"
+    done
+    if command -v fw_setenv >/dev/null 2>&1 && ! fw_setenv --help 2>&1 | grep -q -- --script; then
+        _xi_miss="$_xi_miss fw_setenv(-s)"
+    fi
+    [ -f "$XR_FW_ENV_CONFIG" ] || _xi_miss="$_xi_miss $XR_FW_ENV_CONFIG"
+    [ -z "$_xi_miss" ] || xr_refuse "не хватает:$_xi_miss (свои бинарники не ставим)" \
+        "missing:$_xi_miss (we do not ship binaries)"
+
+    _xi_p=$(xr_platform)
+    if [ "$_xi_p" = zmod ]; then
+        _xi_exp=0
+        if xr_zmod_running; then
+            xr_refuse "zmod ещё выполняет emmc.sh после загрузки, повторите через несколько минут" \
+                "zmod is still running emmc.sh after the boot, try again in a few minutes"
+        fi
+    elif [ "$_xi_exp" != 1 ]; then
+        xr_refuse "поддерживается только zmod (найдено: $_xi_p); для рутованной стоковой прошивки и Forge-X есть экспериментальная установка (флаг --experimental), она не проверялась на принтере" \
+            "only zmod is supported (found: $_xi_p); rooted stock firmware and Forge-X have an experimental installation (flag --experimental), it has not been tested on a printer"
+    fi
+
+    if xr_printing; then
+        xr_refuse "принтер печатает (Moonraker: $(xr_print_state)), повторите после печати" \
+            "the printer is printing (Moonraker: $(xr_print_state)), try again when it is idle"
+    fi
+    _xi_mem=$(xr_mem_total)
+    case "$_xi_mem" in ''|*[!0-9]*) xr_refuse "не удалось прочитать MemTotal" "cannot read MemTotal" ;; esac
+    [ "$_xi_mem" -le 163840 ] || xr_refuse \
+        "MemTotal $_xi_mem КБ больше 163840: платы 256 МБ не поддерживаются" \
+        "MemTotal $_xi_mem kB is above 163840: 256 MB boards are not supported"
+    xr_fw_check
+    if [ "$XR_FW" != ok ]; then
+        xr_refuse "прошивка не из списка проверенных ($XR_FWINFO). Пришлите эту строку автору, чтобы добавить прошивку" \
+            "the firmware is not in the verified list ($XR_FWINFO). Please send this to the author to get the firmware added"
+    fi
+    _xi_bc=$(xr_getenv bootcmd)
+    if [ "$_xi_bc" != "$STOCK_BOOTCMD" ] && [ "$_xi_bc" != "$xr_bootcmd" ] &&
+        { [ "$_xi_p" != zmod ] || [ "$_xi_bc" != "$ARMED_BOOTCMD" ]; }; then
+        xr_refuse "неизвестный bootcmd: $_xi_bc" "unknown bootcmd: $_xi_bc"
+    fi
+    case "$_xi_bc" in
+    "$STOCK_BOOTCMD") _xi_bk=stock ;;
+    "$xr_bootcmd") _xi_bk=extra-ram ;;
+    *) _xi_bk=zmod-armed ;;
+    esac
+    xr_write_probe || xr_refuse "не удаётся записать в $XR_STATE (нет места или файловая система только для чтения)" \
+        "cannot write to $XR_STATE (no space or a read-only filesystem)"
+
+    if [ "$_xi_p" != zmod ]; then
+        xr_msg "ВНИМАНИЕ: экспериментальная установка ($_xi_p), не проверялась на этой системе. При зависании выключите питание: загрузка будет обычной. Пришлите вывод extra-ram check и журнал $XR_STATE/extra-ram.log автору." \
+            "WARNING: experimental installation ($_xi_p), not tested on this system. If the printer hangs, switch the power off: the next boot is a normal one. Send the output of extra-ram check and the log $XR_STATE/extra-ram.log to the author."
+        if [ "$_xi_yes" != 1 ]; then
+            xr_msg "Для продолжения введите yes:" "Type yes to continue:"
+            read -r _xi_ans
+            [ "$_xi_ans" = yes ] || xr_refuse "установка не подтверждена" "installation not confirmed"
+        fi
+    fi
+
+    xr_msg "проверки пройдены: платформа $_xi_p, MemTotal $_xi_mem КБ, прошивка из списка, bootcmd: $_xi_bk" \
+        "checks passed: platform $_xi_p, MemTotal $_xi_mem kB, firmware in the list, bootcmd: $_xi_bk"
+    if [ "$_xi_p" = zmod ]; then
+        xr_zmod_state
+        xr_msg "zmod eMMC при установке: state.txt=$ZM_STATE, ddr.txt=$ZM_DDR, disable.txt=$ZM_DISABLE, метка в cmdline: $ZM_MARK" \
+            "zmod eMMC at install time: state.txt=$ZM_STATE, ddr.txt=$ZM_DDR, disable.txt=$ZM_DISABLE, cmdline mark: $ZM_MARK"
+    fi
+
+    # the baseline (zmod's eMMC state at install time) is kept on re-install while the platform is the same
+    if [ -f "$XR_STATE/installed" ] && [ "$(xr_inst platform)" = "$_xi_p" ] && [ -n "$(xr_inst zm_state)" ]; then
+        xr_installed_keep "$_xi_p" "$_xi_exp"
+    else
+        xr_installed_write "$_xi_p" "$_xi_exp"
+    fi || { xr_msg "extra-ram: не удалось записать $XR_STATE/installed" "extra-ram: cannot write $XR_STATE/installed"; exit 1; }
+    # install is the only way to re-enable the mode after the failure limit
+    if [ "$(xr_get state)" = fail ]; then
+        rm -f "$XR_STATE/state"
+        xr_put fails 0
+    fi
+
+    XR_FW_CHECKED=1 XR_REARM_OURS=1 xr_arm_now
+    if [ $? -eq 0 ]; then
+        xr_msg "Установлено. Перезагрузите принтер, затем запустите extra-ram check" \
+            "Installed. Reboot the printer, then run extra-ram check"
+        return 0
+    fi
+    _xi_last=$(xr_get last)
+    if [ "$_xi_last" = armed_failed ]; then
+        xr_msg "extra-ram: установлено, но взвести режим не удалось (см. $XR_STATE/extra-ram.log); повторите extra-ram install" \
+            "extra-ram: installed, but arming failed (see $XR_STATE/extra-ram.log); run extra-ram install again"
+        return 1
+    fi
+    xr_msg "Установлено, но в эту загрузку режим не взведён ($_xi_last): он взведётся в одну из следующих загрузок. Перезагрузите принтер, затем запустите extra-ram check" \
+        "Installed, but not armed now ($_xi_last): it will be armed on a later boot. Reboot the printer, then run extra-ram check"
+    return 0
+}
+
+# extra-ram uninstall. The boot safety check only runs while $XR_STATE/installed exists, so bootcmd and the
+# xram_* variables are restored (and verified) first; only then the files go.
+xr_cmd_uninstall() {
+    xr_is_root || xr_refuse "нужны права root (запускайте от root)" "must be run as root"
+    _xi_rearm=""
+    if [ "$(xr_platform)" = zmod ]; then
+        xr_zmod_state
+        # zmod's own one-shot boot continues only while it has something to boot
+        if [ "$ZM_STATE" = ok ] && [ -n "$(xr_getenv boot_zmod)" ]; then _xi_rearm=1; fi
+    fi
+    xr_disarm $_xi_rearm
+    xr_env_remove
+    _xi_ok=0
+    if _xi_all=$(fw_printenv 2>/dev/null) && [ "$(xr_getenv bootcmd)" != "$xr_bootcmd" ] &&
+        ! echo "$_xi_all" | grep -q '^xram_'; then
+        _xi_ok=1
+    fi
+    if [ "$_xi_ok" != 1 ]; then
+        # still armed: keep the failure accounting working
+        [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ] && touch "$XR_STATE/armed" 2>/dev/null
+        xr_msg "extra-ram: ошибка записи окружения U-Boot, ничего не удалено; повторите extra-ram uninstall" \
+            "extra-ram: failed to write the U-Boot environment, nothing was removed; run extra-ram uninstall again"
+        return 1
+    fi
+    rm -f "$XR_INIT"
+    rm -rf "$XR_STATE" "$XR_CODE"
+    sync
+    xr_msg "Удалено. Перезагрузите принтер: память вернётся к обычной" \
+        "Uninstalled. Reboot the printer to return to normal memory"
+    return 0
+}
+
 case "$1" in
+install) shift; xr_cmd_install "$@"; exit $? ;;
+uninstall) xr_cmd_uninstall; exit $? ;;
 boot) xr_cmd_boot ;;
 arm-wait) xr_cmd_arm_wait ;;
 *)
-    xr_msg "использование: extra-ram boot|arm-wait" "usage: extra-ram boot|arm-wait"
+    xr_msg "использование: extra-ram install|uninstall|boot|arm-wait" "usage: extra-ram install|uninstall|boot|arm-wait"
     exit 1
     ;;
 esac

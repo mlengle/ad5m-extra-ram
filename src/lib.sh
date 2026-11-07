@@ -18,6 +18,7 @@
 : ${XR_ZMOD_LANG:=/opt/config/mod_data/lang.cfg}
 : ${XR_FORGEX:=/opt/config/mod/.shell}
 : ${XR_MOONRAKER:=http://127.0.0.1:7125}
+: ${XR_FW_ENV_CONFIG:=/etc/fw_env.config}   # fw_printenv/fw_setenv configuration (install checks it exists)
 : ${XR_S99MOON:=/etc/init.d/S99moon}   # zmod's init link (platform detection)
 : ${XR_PROC:=/proc}                     # scanned for running commands
 : ${XR_WAIT_STEP:=5}                   # poll interval of xr_zmod_wait, seconds (tests lower it)
@@ -59,6 +60,23 @@ xr_log() {
         mv -f "$_xr_lf" "$_xr_lf.1"
     fi
     printf '%s %s\n' "$(date '+%F %T')" "$(xr_msg "$1" "$2")" >> "$_xr_lf" 2>/dev/null
+}
+
+# --- printer activity (Moonraker) ---
+# xr_print_state: print_stats.state from Moonraker (standby, printing, paused, complete, cancelled, error);
+# empty when Moonraker is unreachable or answers without a state
+xr_print_state() {
+    wget -q -T 5 -O - "$XR_MOONRAKER/printer/objects/query?print_stats" 2>/dev/null | tr -d '\n' |
+        grep -o '"state": *"[^"]*"' | head -n 1 | sed 's/.*: *"\(.*\)"/\1/'
+}
+
+# xr_printing: succeeds when the printer is busy (any state but standby/complete/cancelled/error);
+# unreachable Moonraker counts as idle
+xr_printing() {
+    case "$(xr_print_state)" in
+    ""|standby|complete|cancelled|error) return 1 ;;
+    esac
+    return 0
 }
 
 # --- memory and firmware ---
@@ -293,11 +311,11 @@ xr_zmod_edits() {
 
 # xr_zmod_running: succeeds when some process has emmc.sh as a command-line argument (own shell excluded)
 xr_zmod_running() {
-    for _xr_p in "$XR_PROC"/[0-9]*; do
-        _xr_n=${_xr_p##*/}
+    for _xr_pd in "$XR_PROC"/[0-9]*; do
+        _xr_n=${_xr_pd##*/}
         [ "$_xr_n" = "$$" ] && continue
-        [ -r "$_xr_p/cmdline" ] || continue
-        _xr_c=$(tr '\0' ' ' < "$_xr_p/cmdline" 2>/dev/null)
+        [ -r "$_xr_pd/cmdline" ] || continue
+        _xr_c=$(tr '\0' ' ' < "$_xr_pd/cmdline" 2>/dev/null)
         case " $_xr_c" in *" emmc.sh "*|*"/emmc.sh "*) return 0 ;; esac
     done
     return 1
