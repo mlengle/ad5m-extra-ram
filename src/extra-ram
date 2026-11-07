@@ -1,6 +1,6 @@
 #!/bin/sh
 # extra-ram: frees the DSP/OP-TEE memory reservations of the AD5M through a one-shot U-Boot boot.
-# Subcommands: install, check (read-only report), uninstall, boot (init hook, run by S45xram), arm-wait (arming on zmod, after zmod's emmc.sh).
+# Subcommands: install, check (read-only report), test (memory self-test), uninstall, boot (init hook, run by S45xram), arm-wait (arming on zmod, after zmod's emmc.sh).
 #
 # State files in $XR_STATE: installed (platform=, experimental=, zm_* baseline, version=), state (ok|fail|empty),
 # fails (consecutive boots that did not reach the system), armed (exists = we armed the next boot),
@@ -601,14 +601,55 @@ xr_cmd_check() {
     return 0
 }
 
+# extra-ram test [--force]: the memory self-test (about 11 minutes, runs in the foreground).
+# Refuses unless installed, the mode is active in this boot (xram_on in the cmdline), the printer is idle and
+# python3 exists; Moonraker unreachable is a refusal too unless --force (an unreachable Moonraker may hide a print).
+# Exit 0 when the last line of the self-test output is "RESULT PASS", else 1.
+xr_cmd_test() {
+    _xt_force=0
+    for _xt_a in "$@"; do
+        case "$_xt_a" in
+        --force) _xt_force=1 ;;
+        *) xr_refuse "использование: extra-ram test [--force]" "usage: extra-ram test [--force]" ;;
+        esac
+    done
+    xr_is_root || xr_refuse "нужны права root (запускайте от root)" "must be run as root"
+    [ -f "$XR_STATE/installed" ] || xr_refuse "extra-ram не установлен (extra-ram install)" \
+        "extra-ram is not installed (extra-ram install)"
+    grep -qw xram_on "$XR_CMDLINE" 2>/dev/null || xr_refuse \
+        "в этой загрузке нет метки xram_on: тест имеет смысл только при работающем режиме (см. extra-ram check)" \
+        "no xram_on marker in this boot: the test makes sense only while the mode is active (see extra-ram check)"
+    [ -x "$XR_PYTHON" ] || xr_refuse "нет $XR_PYTHON (python3 нужен тесту памяти)" \
+        "$XR_PYTHON not found (the memory test needs python3)"
+    [ -f "$XR_SELFTEST" ] || xr_refuse "нет скрипта теста: $XR_SELFTEST" "the self-test script is missing: $XR_SELFTEST"
+    _xt_st=$(xr_print_state)
+    if xr_printing; then
+        xr_refuse "принтер печатает (Moonraker: $_xt_st), повторите после печати" \
+            "the printer is printing (Moonraker: $_xt_st), try again when it is idle"
+    fi
+    if [ -z "$_xt_st" ] && [ "$_xt_force" != 1 ]; then
+        xr_refuse "Moonraker недоступен, не удалось проверить, что принтер не печатает; если уверены, что он простаивает, добавьте --force" \
+            "Moonraker is unreachable, cannot check that the printer is not printing; add --force if you are sure it is idle"
+    fi
+    xr_msg "Тест памяти займёт около 11 минут, принтер всё это время должен простаивать (не запускайте печать). Если принтер зависнет, выключите и включите питание и пришлите вывод extra-ram check автору. Результат: последняя строка RESULT PASS или RESULT FAIL, журналы: $XR_TESTDIR" \
+        "The memory test takes about 11 minutes, keep the printer idle meanwhile (do not start a print). If the printer freezes, power-cycle it and send the output of extra-ram check to the author. Result: the last line is RESULT PASS or RESULT FAIL, logs: $XR_TESTDIR"
+    export XR_STATE XR_TESTDIR XR_PYTHON XR_CMDLINE XR_MEMINFO XR_BOOTID XR_MEMBLOCK
+    _xt_out=$XR_TMP/extra-ram-test.$$
+    sh "$XR_SELFTEST" 2>&1 | tee "$_xt_out"
+    _xt_last=$(tail -n 1 "$_xt_out" 2>/dev/null | tr -d '\r')
+    rm -f "$_xt_out"
+    [ "$_xt_last" = "RESULT PASS" ]
+}
+
 case "$1" in
 install) shift; xr_cmd_install "$@"; exit $? ;;
 uninstall) xr_cmd_uninstall; exit $? ;;
 check) xr_cmd_check; exit 0 ;;
+test) shift; xr_cmd_test "$@"; exit $? ;;
 boot) xr_cmd_boot ;;
 arm-wait) xr_cmd_arm_wait ;;
 *)
-    xr_msg "использование: extra-ram install|check|uninstall|boot|arm-wait" "usage: extra-ram install|check|uninstall|boot|arm-wait"
+    xr_msg "использование: extra-ram install|check|test|uninstall|boot|arm-wait" "usage: extra-ram install|check|test|uninstall|boot|arm-wait"
     exit 1
     ;;
 esac

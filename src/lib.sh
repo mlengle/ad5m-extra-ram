@@ -21,6 +21,9 @@
 : ${XR_FW_ENV_CONFIG:=/etc/fw_env.config}   # fw_printenv/fw_setenv configuration (install checks it exists)
 : ${XR_S99MOON:=/etc/init.d/S99moon}   # zmod's init link (platform detection)
 : ${XR_PROC:=/proc}                     # scanned for running commands
+: ${XR_TESTDIR:=$XR_STATE/test}         # output of "extra-ram test" (logs, csv, pid files)
+: ${XR_SELFTEST:=$XR_CODE/test/selftest.sh}   # the memory self-test (tests stub it)
+: ${XR_PYTHON:=/usr/bin/python3}       # the harvester of the self-test needs it
 : ${XR_WAIT_STEP:=5}                   # poll interval of xr_zmod_wait, seconds (tests lower it)
 
 # --- verified firmware list: "dtb-md5 CRC optee-md5" triplets (firmware 3.1.5) ---
