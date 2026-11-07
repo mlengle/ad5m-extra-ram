@@ -184,23 +184,31 @@ xr_env_write() {
     return $_xr_rc
 }
 
-# xr_arm EMMC_EDITS: arm the one-shot boot (needs XR_CRC from xr_fw_check). The four variables and
-# bootcmd go in one write with bootcmd last; everything is read back. On success $XR_STATE/armed is
-# created. On any failure the stock bootcmd is restored (if bootcmd is not stock) and armed removed.
+# xr_arm EMMC_EDITS: arm the one-shot boot (needs XR_CRC from xr_fw_check; without it nothing is
+# written). The four variables and bootcmd go in one write with bootcmd last; everything is read back
+# and $XR_STATE/armed is created. On any failure after the write attempt, bootcmd is rolled back: to
+# the value it had before when that was the stock or zmod's armed one (so zmod's own one-shot boot
+# is not disturbed), otherwise to the stock bootcmd; armed is removed and 1 is returned.
 xr_arm() {
-    if [ -n "$XR_CRC" ]; then
-        xr_env_values "$XR_CRC" "$1"
-        if xr_env_write xram_main "$XV_MAIN" xram_boot "$XV_BOOT" xram_del "$XV_DEL" xram_skip "$XV_SKIP" bootcmd "$xr_bootcmd" &&
-            [ "$(xr_getenv xram_main)" = "$XV_MAIN" ] && [ "$(xr_getenv xram_boot)" = "$XV_BOOT" ] &&
-            [ "$(xr_getenv xram_del)" = "$XV_DEL" ] && [ "$(xr_getenv xram_skip)" = "$XV_SKIP" ] &&
-            [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
-            mkdir -p "$XR_STATE" && touch "$XR_STATE/armed" && sync
-            return 0
-        fi
+    rm -f "$XR_STATE/armed"
+    [ -n "$XR_CRC" ] || return 1
+    _xr_bc0=$(xr_getenv bootcmd)
+    xr_env_values "$XR_CRC" "$1"
+    if xr_env_write xram_main "$XV_MAIN" xram_boot "$XV_BOOT" xram_del "$XV_DEL" xram_skip "$XV_SKIP" bootcmd "$xr_bootcmd" &&
+        [ "$(xr_getenv xram_main)" = "$XV_MAIN" ] && [ "$(xr_getenv xram_boot)" = "$XV_BOOT" ] &&
+        [ "$(xr_getenv xram_del)" = "$XV_DEL" ] && [ "$(xr_getenv xram_skip)" = "$XV_SKIP" ] &&
+        [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ] &&
+        mkdir -p "$XR_STATE" 2>/dev/null && touch "$XR_STATE/armed" 2>/dev/null; then
+        sync
+        return 0
     fi
     rm -f "$XR_STATE/armed"
-    if [ "$(xr_getenv bootcmd)" != "$STOCK_BOOTCMD" ]; then
-        fw_setenv bootcmd "$STOCK_BOOTCMD"
+    if [ "$(xr_getenv bootcmd)" != "$_xr_bc0" ]; then
+        if [ "$_xr_bc0" = "$STOCK_BOOTCMD" ] || [ "$_xr_bc0" = "$ARMED_BOOTCMD" ]; then
+            fw_setenv bootcmd "$_xr_bc0"
+        else
+            fw_setenv bootcmd "$STOCK_BOOTCMD"
+        fi
     fi
     return 1
 }
@@ -209,6 +217,7 @@ xr_arm() {
 # ZMOD_REARM=1 (zmod's own one-shot boot continues), else the stock one
 xr_disarm() {
     rm -f "$XR_STATE/armed"
+    sync
     if [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
         if [ "$1" = 1 ]; then
             fw_setenv bootcmd "$ARMED_BOOTCMD"
