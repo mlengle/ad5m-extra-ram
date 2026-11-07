@@ -150,14 +150,26 @@ xr_arm_now() {
     _xr_rearm=""
     if [ "$(xr_platform)" = zmod ]; then
         if [ "$XR_REARM_OURS" = 1 ] && xr_is_ours "$(xr_getenv bootcmd)"; then
-            # re-arm with the edits of the previous arming, but only while zmod's eMMC state is still ok;
-            # otherwise give back the stock bootcmd: zmod's own first-run path then arms its eMMC test
+            # re-arm with the eMMC edits of zmod's current boot_zmod, but only while zmod's eMMC state is still
+            # ok and boot_zmod is a known variant; otherwise give back the stock bootcmd (xr_disarm without
+            # ZMOD_REARM): zmod's own first-run path then arms again
             xr_edits_of_armed
             if [ -n "$XR_EDITS" ] && [ "$ZM_STATE" != ok ]; then
                 xr_disarm
                 xr_put last zmod_emmc_testing
                 xr_say "не взводится: zmod_emmc_testing" "not armed: zmod_emmc_testing"
                 return 1
+            fi
+            if [ -n "$XR_EDITS" ]; then
+                if xr_zmod_find "*" "$(xr_getenv boot_zmod)"; then
+                    XR_EDITS=$XZ_EDITS
+                else
+                    xr_disarm
+                    xr_put last zmod_unknown_boot_zmod
+                    xr_say "не взводится: zmod_unknown_boot_zmod (md5 emmc.sh: $(xr_zmod_id))" \
+                        "not armed: zmod_unknown_boot_zmod (emmc.sh md5: $(xr_zmod_id))"
+                    return 1
+                fi
             fi
         elif ! xr_zmod_edits >/dev/null; then
             xr_put last "$XR_REASON"
@@ -451,9 +463,13 @@ xr_cmd_uninstall() {
     _xu_armed=0; [ -f "$XR_STATE/armed" ] && _xu_armed=1
     xr_disarm $_xu_rearm
     # the variables go only after a positive check: bootcmd read back and it is the stock one or zmod's armed
-    # one (a failed read or any other value could still lead to xram_main)
+    # one (a failed read or any other value could still lead to xram_main). On zmod any bootcmd that is not
+    # ours and does not mention xram_ counts too: it is the armed bootcmd of a zmod version we do not know
+    # (zmod knows nothing of our variables), and it stays until zmod's one-shot boot has run.
     if _xu_bc=$(fw_printenv -n bootcmd 2>/dev/null) &&
-        { [ "$_xu_bc" = "$STOCK_BOOTCMD" ] || xr_zmod_find "$_xu_bc" "*"; }; then
+        { [ "$_xu_bc" = "$STOCK_BOOTCMD" ] || xr_zmod_find "$_xu_bc" "*" ||
+            { [ "$(xr_platform)" = zmod ] && [ -n "$_xu_bc" ] && ! xr_is_ours "$_xu_bc" &&
+                case "$_xu_bc" in *xram_*) false ;; *) true ;; esac; }; }; then
         :
     else
         # keep everything: if still armed, the failure accounting keeps working
