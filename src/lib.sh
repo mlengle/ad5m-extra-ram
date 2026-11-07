@@ -18,6 +18,9 @@
 : ${XR_ZMOD_LANG:=/opt/config/mod_data/lang.cfg}
 : ${XR_FORGEX:=/opt/config/mod/.shell}
 : ${XR_MOONRAKER:=http://127.0.0.1:7125}
+: ${XR_S99MOON:=/etc/init.d/S99moon}   # zmod's init link (platform detection)
+: ${XR_PROC:=/proc}                     # scanned for running commands
+: ${XR_WAIT_STEP:=5}                   # poll interval of xr_zmod_wait, seconds (tests lower it)
 
 # --- verified firmware list: "dtb-md5 CRC optee-md5" triplets (firmware 3.1.5) ---
 # CRC is the crc32 of sunxi.dtb as the printer's U-Boot prints it; the OP-TEE md5 is required in both
@@ -237,4 +240,83 @@ xr_env_remove() {
         set -- "$@" "$_xr_n" ""
     done
     xr_env_write "$@"
+}
+
+# --- platform detection and zmod eMMC adapter (zmod files and its U-Boot variables are read-only for us) ---
+
+# xr_platform: print zmod, forgex or stock
+xr_platform() {
+    if [ -e "$XR_ZMOD_SH" ]; then echo zmod; return 0; fi
+    _xr_l=$(readlink "$XR_S99MOON" 2>/dev/null)
+    case "$_xr_l" in /usr/data/zmod*) echo zmod; return 0 ;; esac
+    if [ -e "$XR_FORGEX" ]; then echo forgex; return 0; fi
+    echo stock
+}
+
+# xr_zmod_state: set ZM_STATE (state.txt or none), ZM_DDR, ZM_DISABLE (0|1) and ZM_MARK (zmod_emmc_ddr,
+# zmod_emmc_50 or none, from the kernel cmdline). Read-only.
+xr_zmod_state() {
+    ZM_STATE=""
+    [ -f "$XR_ZMOD_EMMC/state.txt" ] && read -r ZM_STATE < "$XR_ZMOD_EMMC/state.txt"
+    [ -n "$ZM_STATE" ] || ZM_STATE=none
+    ZM_DDR=0; [ -f "$XR_ZMOD_EMMC/ddr.txt" ] && ZM_DDR=1
+    ZM_DISABLE=0; [ -f "$XR_ZMOD_EMMC/disable.txt" ] && ZM_DISABLE=1
+    ZM_MARK=none
+    if grep -qw zmod_emmc_ddr "$XR_CMDLINE" 2>/dev/null; then ZM_MARK=zmod_emmc_ddr
+    elif grep -qw zmod_emmc_50 "$XR_CMDLINE" 2>/dev/null; then ZM_MARK=zmod_emmc_50
+    fi
+}
+
+# xr_zmod_edits: decide the eMMC edits for arming on zmod, from bootcmd and boot_zmod (U-Boot decides, not
+# ddr.txt). Prints the edits (possibly none) and sets XR_EDITS; returns 0. Returns 1 with XR_REASON set when
+# arming must not happen. Call it without a command substitution (xr_zmod_edits >/dev/null) when XR_REASON
+# is needed: a subshell loses the variables.
+xr_zmod_edits() {
+    XR_EDITS=""; XR_REASON=""
+    xr_zmod_state
+    _xr_bc=$(xr_getenv bootcmd)
+    if [ "$_xr_bc" = "$ARMED_BOOTCMD" ]; then
+        if [ "$ZM_STATE" != ok ]; then XR_REASON=zmod_emmc_testing; return 1; fi
+        _xr_bz=$(xr_getenv boot_zmod)
+        if [ "$_xr_bz" = "$BOOT_ZMOD_B" ]; then XR_EDITS=$EMMC_FDT
+        elif [ "$_xr_bz" = "$BOOT_ZMOD_B_DDR" ]; then XR_EDITS=$EMMC_FDT_DDR
+        else XR_REASON=zmod_unknown_boot_zmod; return 1
+        fi
+        printf '%s\n' "$XR_EDITS"
+        return 0
+    fi
+    if [ "$_xr_bc" = "$STOCK_BOOTCMD" ]; then echo; return 0; fi
+    if [ "$_xr_bc" = "$xr_bootcmd" ]; then XR_REASON=already_armed; return 1; fi
+    XR_REASON=unknown_bootcmd
+    return 1
+}
+
+# xr_zmod_running: succeeds when some process has emmc.sh as a command-line argument (own shell excluded)
+xr_zmod_running() {
+    for _xr_p in "$XR_PROC"/[0-9]*; do
+        _xr_n=${_xr_p##*/}
+        [ "$_xr_n" = "$$" ] && continue
+        [ -r "$_xr_p/cmdline" ] || continue
+        _xr_c=$(tr '\0' ' ' < "$_xr_p/cmdline" 2>/dev/null)
+        case " $_xr_c" in *" emmc.sh "*|*"/emmc.sh "*) return 0 ;; esac
+    done
+    return 1
+}
+
+# xr_zmod_wait [TIMEOUT]: wait (default 900 s, poll every XR_WAIT_STEP s) until zmod's emmc.sh has finished
+# this boot: boot_id.txt equals the current boot id AND no emmc.sh process is left (boot_id.txt is written
+# early in the run, before arming). Returns 0 at once without zmod; 1 on timeout.
+xr_zmod_wait() {
+    [ -e "$XR_ZMOD_SH" ] || return 0
+    _xr_to=${1:-900}; _xr_el=0; _xr_st=$XR_WAIT_STEP
+    case "$_xr_to" in ""|*[!0-9]*) _xr_to=900 ;; esac
+    case "$_xr_st" in ''|*[!0-9]*|0) _xr_st=5 ;; esac
+    while :; do
+        _xr_cur=$(cat "$XR_BOOTID" 2>/dev/null)
+        _xr_seen=""; [ -f "$XR_ZMOD_EMMC/boot_id.txt" ] && read -r _xr_seen < "$XR_ZMOD_EMMC/boot_id.txt"
+        if [ -n "$_xr_cur" ] && [ "$_xr_seen" = "$_xr_cur" ] && ! xr_zmod_running; then return 0; fi
+        [ "$_xr_el" -ge "$_xr_to" ] && return 1
+        sleep "$_xr_st"
+        _xr_el=$((_xr_el + _xr_st))
+    done
 }
