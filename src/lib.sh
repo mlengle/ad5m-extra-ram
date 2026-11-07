@@ -139,3 +139,93 @@ xr_fw_check() {
         shift 3
     done
 }
+
+# --- U-Boot variables (one-shot EXTRA_RAM boot) ---
+# xr_bootcmd runs once: it restores the stock bootcmd and saves it first, so a hang or power cycle
+# later returns to the stock boot; then it runs xram_main.
+xr_bootcmd='setenv bootcmd run setargs_mmc boot_dsp0 boot_uImage;saveenv;run setargs_mmc xram_main'
+# Scratch word for the crc32 result, inside the dtb gap below the dtb load address (0x44864e70)
+XR_SCRATCH=0x44864e00
+# xram_main: load, compute the dtb CRC into xram_crc (mw.l first: crc32 must not leave stale data),
+# select xram_del when it matches the verified CRC, xram_skip otherwise (data-driven: no failing
+# commands, no hangs on the logo screen)
+XR_MAIN_PRE='part list mmc 0;fatload mmc 0:1 0x43000000 uImage;fatload mmc 0:1 0x44864e70 sunxi.dtb;setenv xram_sel xram_skip;setenv xram_crc none;mw.l '"$XR_SCRATCH"' 0;crc32 0x44864e70 ${filesize} '"$XR_SCRATCH"';setexpr.l xram_crc *'"$XR_SCRATCH"';setexpr xram_sel sub ^'
+XR_MAIN_POST='$ xram_del ${xram_crc};run xram_boot'
+XR_DEL='fdt rsvmem delete 3;fdt rsvmem delete 2;fdt rsvmem delete 1;fdt rsvmem delete 0;fdt rsvmem add 0x41b00000 0x100000;setenv bootargs ${bootargs} xram_on'
+XR_SKIP='setenv bootargs ${bootargs} xram_skip'
+XR_BOOTM='run ${xram_sel};bootm 0x43000000 - 0x44864e70;run setargs_mmc boot_uImage'
+
+# xr_getenv NAME: value of a U-Boot variable (empty if not defined)
+xr_getenv() {
+    fw_printenv -n "$1" 2>/dev/null
+}
+
+# xr_env_values CRC EMMC_EDITS: set XV_MAIN, XV_BOOT, XV_DEL, XV_SKIP (the values of xram_main,
+# xram_boot, xram_del, xram_skip). EMMC_EDITS may be empty.
+xr_env_values() {
+    XV_MAIN="${XR_MAIN_PRE}$1${XR_MAIN_POST}"
+    XV_BOOT="fdt addr 0x44864e70;fdt resize;${2:+$2;}${XR_BOOTM}"
+    XV_DEL=$XR_DEL
+    XV_SKIP=$XR_SKIP
+}
+
+# xr_env_write NAME VALUE ...: write the variables with a single environment write (fw_setenv -s);
+# an empty value deletes the variable
+xr_env_write() {
+    _xr_ef=$XR_TMP/xram_env.$$
+    : > $_xr_ef
+    while [ $# -ge 2 ]; do
+        printf '%s %s\n' "$1" "$2" >> $_xr_ef
+        shift 2
+    done
+    fw_setenv -s $_xr_ef
+    _xr_rc=$?
+    rm -f $_xr_ef
+    return $_xr_rc
+}
+
+# xr_arm EMMC_EDITS: arm the one-shot boot (needs XR_CRC from xr_fw_check). The four variables and
+# bootcmd go in one write with bootcmd last; everything is read back. On success $XR_STATE/armed is
+# created. On any failure the stock bootcmd is restored (if bootcmd is not stock) and armed removed.
+xr_arm() {
+    if [ -n "$XR_CRC" ]; then
+        xr_env_values "$XR_CRC" "$1"
+        if xr_env_write xram_main "$XV_MAIN" xram_boot "$XV_BOOT" xram_del "$XV_DEL" xram_skip "$XV_SKIP" bootcmd "$xr_bootcmd" &&
+            [ "$(xr_getenv xram_main)" = "$XV_MAIN" ] && [ "$(xr_getenv xram_boot)" = "$XV_BOOT" ] &&
+            [ "$(xr_getenv xram_del)" = "$XV_DEL" ] && [ "$(xr_getenv xram_skip)" = "$XV_SKIP" ] &&
+            [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
+            mkdir -p "$XR_STATE" && touch "$XR_STATE/armed" && sync
+            return 0
+        fi
+    fi
+    rm -f "$XR_STATE/armed"
+    if [ "$(xr_getenv bootcmd)" != "$STOCK_BOOTCMD" ]; then
+        fw_setenv bootcmd "$STOCK_BOOTCMD"
+    fi
+    return 1
+}
+
+# xr_disarm [ZMOD_REARM]: remove armed; if bootcmd is ours restore it: zmod's armed bootcmd when
+# ZMOD_REARM=1 (zmod's own one-shot boot continues), else the stock one
+xr_disarm() {
+    rm -f "$XR_STATE/armed"
+    if [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
+        if [ "$1" = 1 ]; then
+            fw_setenv bootcmd "$ARMED_BOOTCMD"
+        else
+            fw_setenv bootcmd "$STOCK_BOOTCMD"
+        fi
+    fi
+    return 0
+}
+
+# xr_env_remove: delete every xram_* variable (including the runtime-only ones) in one write
+xr_env_remove() {
+    _xr_names=$(fw_printenv 2>/dev/null | sed -n 's/^\(xram_[A-Za-z0-9_]*\)=.*/\1/p')
+    [ -n "$_xr_names" ] || return 0
+    set --
+    for _xr_n in $_xr_names; do
+        set -- "$@" "$_xr_n" ""
+    done
+    xr_env_write "$@"
+}
