@@ -1,6 +1,6 @@
 #!/bin/sh
 # extra-ram: frees the DSP/OP-TEE memory reservations of the AD5M through a one-shot U-Boot boot.
-# Subcommands: install, uninstall, boot (init hook, run by S45xram), arm-wait (arming on zmod, after zmod's emmc.sh).
+# Subcommands: install, check (read-only report), uninstall, boot (init hook, run by S45xram), arm-wait (arming on zmod, after zmod's emmc.sh).
 #
 # State files in $XR_STATE: installed (platform=, experimental=, zm_* baseline, version=), state (ok|fail|empty),
 # fails (consecutive boots that did not reach the system), armed (exists = we armed the next boot),
@@ -453,13 +453,162 @@ xr_cmd_uninstall() {
     return 0
 }
 
+# --- check ---
+
+# xc_reason CODE: print the explanation of a "last" reason code (why the mode is not active / not armed)
+xc_reason() {
+    case "$1" in
+    active) xr_msg "в этой загрузке нет метки xram_on, хотя прошлая работала: скрипт загрузки в эту загрузку не запускался" \
+        "this boot has no xram_on marker although an earlier boot was active: the boot hook has not run in this boot" ;;
+    armed) xr_msg "режим взведён на следующую загрузку, перезагрузите принтер" \
+        "the mode is armed for the next boot, reboot the printer" ;;
+    armed_failed) xr_msg "ошибка взвода (окружение U-Boot или $XR_STATE, см. $XR_STATE/extra-ram.log), запустите extra-ram install ещё раз" \
+        "arming failed (U-Boot environment or $XR_STATE, see $XR_STATE/extra-ram.log), run extra-ram install again" ;;
+    waiting_zmod) xr_msg "идёт ожидание: режим взводится после того, как zmod закончит emmc.sh этой загрузки (повторите check через несколько минут)" \
+        "waiting: the mode is armed after zmod has finished emmc.sh of this boot (run check again in a few minutes)" ;;
+    safe_mode) xr_msg "безопасный режим Forge-X, режим не взводится" "Forge-X safe mode, the mode is not armed" ;;
+    unknown_bootcmd) xr_msg "bootcmd не штатный и не наш (его изменил кто-то другой), режим не взводится" \
+        "bootcmd is neither the stock one nor ours (someone else changed it), the mode is not armed" ;;
+    already_armed) xr_msg "bootcmd уже наш, повторно не взводится" "bootcmd is already ours, not armed again" ;;
+    odd_reservations) xr_msg "в загрузке с режимом неожиданные резервирования памяти, режим отключён" \
+        "unexpected memory reservations in a boot with the mode, the mode was disabled" ;;
+    boot_failed) xr_msg "загрузка с режимом не дошла до системы ($(xc_fails) из $XR_MAX_FAILS)" \
+        "the boot with the mode did not reach the system ($(xc_fails) of $XR_MAX_FAILS)" ;;
+    dtb_changed) xr_msg "sunxi.dtb изменился после взвода (обновилась прошивка?), U-Boot загрузил систему без режима" \
+        "sunxi.dtb changed after arming (firmware updated?), U-Boot booted without the mode" ;;
+    firmware_unknown)
+        xr_fw_check
+        xr_msg "прошивка не из списка проверенных ($XR_FWINFO). Пришлите эту строку автору, чтобы добавить прошивку" \
+            "the firmware is not in the verified list ($XR_FWINFO). Please send this to the author to get the firmware added" ;;
+    zmod_emmc_testing) xr_msg "zmod сейчас проверяет 50 МГц (state.txt не ok): режим не взводится, чтобы не смешивать сбои; взведётся после проверки" \
+        "zmod is testing eMMC 50 MHz now (state.txt is not ok): not armed so the failures do not mix; it is armed after the test" ;;
+    zmod_unknown_boot_zmod) xr_msg "boot_zmod в zmod не из известных строк (новая версия zmod?), режим не взводится; пришлите вывод check автору" \
+        "zmod's boot_zmod is not one of the known strings (new zmod version?), not armed; send the output of check to the author" ;;
+    zmod_wait_timeout) xr_msg "zmod emmc.sh не закончил за 15 минут (идёт тест eMMC?), в ту загрузку режим не взведён" \
+        "zmod emmc.sh did not finish in 15 minutes (eMMC test running?), not armed in that boot" ;;
+    platform_changed) xr_msg "система сменилась (при установке: $(xr_inst platform), сейчас: $(xr_platform)), режим не взводится; переустановите zmod или extra-ram с флагом --experimental" \
+        "the platform changed (at install: $(xr_inst platform), now: $(xr_platform)), not armed; reinstall zmod or install extra-ram with --experimental" ;;
+    tee_missing) xr_msg "в загрузке с режимом TEE_RAM не был зарезервирован (опасно), режим отключён" \
+        "TEE_RAM was not reserved in a boot with the mode (dangerous), the mode was disabled" ;;
+    tee_unverified) xr_msg "резервирование TEE_RAM проверить не удалось (нет $XR_FDT и $XR_MEMBLOCK), в ту загрузку режим не взводится" \
+        "the TEE_RAM reservation could not be verified (no $XR_FDT and $XR_MEMBLOCK), not armed in that boot" ;;
+    "") xr_msg "результата пока нет, перезагрузите принтер" "no result recorded yet, reboot the printer" ;;
+    *) xr_msg "неизвестная причина: $1" "unknown reason: $1" ;;
+    esac
+}
+
+# xc_fails: the failed-boot counter as a number
+xc_fails() {
+    _xc_f=$(xr_get fails)
+    case "$_xc_f" in ''|*[!0-9]*) _xc_f=0 ;; esac
+    echo "$_xc_f"
+}
+
+# xc_extra_ram: print the "Extra RAM" line; sets XC_LAST_SHOWN=1 when the explanation of "last" went into it
+xc_extra_ram() {
+    XC_LAST_SHOWN=0
+    _xc_last=$(xr_get last)
+    _xc_state=$(xr_get state)
+    _xc_why=""
+    if grep -qw xram_on "$XR_CMDLINE" 2>/dev/null; then
+        xr_verify
+        if [ "$XR_TEE" = missing ]; then _xc_why=tee_missing
+        elif [ "$XR_ODD" = 1 ]; then _xc_why=odd_reservations
+        elif [ "$XR_TEE" = unknown ]; then _xc_why=tee_unverified
+        else
+            xr_msg "Дополнительная память: работает (MemTotal $(xr_mem_total) КБ, TEE_RAM зарезервирован)" \
+                "Extra RAM: active (MemTotal $(xr_mem_total) kB, TEE_RAM reserved)"
+            return 0
+        fi
+    elif grep -qw xram_skip "$XR_CMDLINE" 2>/dev/null; then
+        _xc_why=dtb_changed
+    else
+        _xc_why=$_xc_last
+    fi
+    XC_LAST_SHOWN=1
+    if [ "$_xc_state" = fail ]; then
+        xr_msg "Дополнительная память: не работает: режим отключён ($(xc_reason "$_xc_why"))" \
+            "Extra RAM: not active: the mode is disabled ($(xc_reason "$_xc_why"))"
+    else
+        xr_msg "Дополнительная память: не работает: $(xc_reason "$_xc_why")" \
+            "Extra RAM: not active: $(xc_reason "$_xc_why")"
+    fi
+}
+
+# xc_zmod: the zmod eMMC lines (only on zmod): comparison with the baseline of install, advice
+xc_zmod() {
+    [ "$(xr_platform)" = zmod ] || return 0
+    xr_zmod_state
+    _xc_bs=$(xr_inst zm_state); _xc_bd=$(xr_inst zm_ddr); _xc_bx=$(xr_inst zm_disable)
+    _xc_hang=0
+    if [ "$ZM_STATE" = "$_xc_bs" ] && [ "$ZM_DDR" = "$_xc_bd" ] && [ "$ZM_DISABLE" = "$_xc_bx" ]; then
+        xr_msg "eMMC 50 МГц/DDR52: как при установке (state=$ZM_STATE, ddr.txt=$ZM_DDR, disable.txt=$ZM_DISABLE, метка в cmdline: $ZM_MARK)" \
+            "eMMC 50 MHz/DDR52: same as at install (state=$ZM_STATE, ddr.txt=$ZM_DDR, disable.txt=$ZM_DISABLE, cmdline mark: $ZM_MARK)"
+    else
+        _xc_dis=""
+        if [ "$ZM_DISABLE" != "$_xc_bx" ]; then
+            _xc_dis=$(xr_msg " (disable.txt: было $_xc_bx, сейчас $ZM_DISABLE)" " (disable.txt: was $_xc_bx, now $ZM_DISABLE)")
+        fi
+        xr_msg "eMMC 50 МГц/DDR52: изменилось: было state=$_xc_bs ddr=$_xc_bd, сейчас state=$ZM_STATE ddr=$ZM_DDR$_xc_dis" \
+            "eMMC 50 MHz/DDR52: changed: was state=$_xc_bs ddr=$_xc_bd, now state=$ZM_STATE ddr=$ZM_DDR$_xc_dis"
+        if [ "$ZM_STATE" = fail ] && [ "$_xc_bs" != fail ]; then
+            _xc_hang=1
+            xr_msg "  Что делать (50 МГц): удалите файлы в /opt/config/mod_data/emmc (disable.txt оставьте, если создавали его вы) и перезагрузите принтер дважды" \
+                "  What to do (50 MHz): delete the files in /opt/config/mod_data/emmc (keep disable.txt if you created it) and reboot twice"
+            if [ "$_xc_bd" = 1 ]; then
+                xr_msg "  Когда state.txt снова станет ok, для DDR52 создайте /opt/config/mod_data/emmc/ddr.txt и перезагрузите принтер" \
+                    "  When state.txt is ok again, for DDR52 create /opt/config/mod_data/emmc/ddr.txt and reboot"
+            fi
+        elif [ "$_xc_bd" = 1 ] && [ "$ZM_DDR" = 0 ] && [ "$ZM_STATE" = ok ]; then
+            _xc_hang=1
+            xr_msg "  Что делать (DDR52): создайте /opt/config/mod_data/emmc/ddr.txt и перезагрузите принтер" \
+                "  What to do (DDR52): create /opt/config/mod_data/emmc/ddr.txt and reboot"
+        fi
+    fi
+    [ "$(xc_fails)" -gt 0 ] && _xc_hang=1
+    if [ "$_xc_hang" = 1 ]; then
+        xr_msg "  Примечание: если загрузка с дополнительной памятью зависает, zmod сразу отключает DDR52 (удаляет ddr.txt), а 50 МГц после 3 неудач" \
+            "  Note: if the boot with extra RAM hangs, zmod drops DDR52 at once (deletes ddr.txt) and 50 MHz after 3 failures"
+    fi
+}
+
+# extra-ram check: read-only report, exit 0 always
+xr_cmd_check() {
+    if [ ! -f "$XR_STATE/installed" ]; then
+        xr_msg "Дополнительная память: не установлено. Запустите extra-ram install" \
+            "Extra RAM: not installed. Run extra-ram install"
+        return 0
+    fi
+    xc_extra_ram
+    xc_zmod
+    if [ "$(xr_getenv bootcmd)" = "$xr_bootcmd" ]; then
+        xr_msg "Взведён на следующую загрузку: да" "Armed for the next boot: yes"
+    elif [ "$XC_LAST_SHOWN" = 0 ] && [ -n "$_xc_last" ] && [ "$_xc_last" != active ]; then
+        # the line above is "active": say why the next boot is not armed
+        xr_msg "Взведён на следующую загрузку: нет ($(xc_reason "$_xc_last"))" \
+            "Armed for the next boot: no ($(xc_reason "$_xc_last"))"
+    else
+        xr_msg "Взведён на следующую загрузку: нет" "Armed for the next boot: no"
+    fi
+    if [ "$(xr_inst experimental)" = 1 ]; then
+        xr_msg "Экспериментальная установка ($(xr_inst platform)): на этой системе не проверялась; при зависании выключите питание, загрузка будет обычной" \
+            "Experimental installation ($(xr_inst platform)): not tested on this system; if the printer hangs, switch the power off, the next boot is a normal one"
+    fi
+    if [ "$_xc_state" = fail ]; then
+        xr_msg "Режим отключён после неудач: запустите extra-ram install ещё раз, чтобы включить его" \
+            "The mode is disabled after failures: run extra-ram install again to re-enable it"
+    fi
+    return 0
+}
+
 case "$1" in
 install) shift; xr_cmd_install "$@"; exit $? ;;
 uninstall) xr_cmd_uninstall; exit $? ;;
+check) xr_cmd_check; exit 0 ;;
 boot) xr_cmd_boot ;;
 arm-wait) xr_cmd_arm_wait ;;
 *)
-    xr_msg "использование: extra-ram install|uninstall|boot|arm-wait" "usage: extra-ram install|uninstall|boot|arm-wait"
+    xr_msg "использование: extra-ram install|check|uninstall|boot|arm-wait" "usage: extra-ram install|check|uninstall|boot|arm-wait"
     exit 1
     ;;
 esac
