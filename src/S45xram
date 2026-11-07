@@ -1,0 +1,6 @@
+#!/bin/sh
+# extra-ram boot hook: post-boot TEE_RAM check, failure accounting, arming of the one-shot boot.
+# A missing /opt/extra-ram must not break the boot (U-Boot still reserves TEE_RAM; only the check and
+# re-arming are lost).
+case "$1" in start) [ -x /opt/extra-ram/extra-ram ] && /opt/extra-ram/extra-ram boot ;; esac
+exit 0

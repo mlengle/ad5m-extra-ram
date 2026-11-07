@@ -324,3 +324,56 @@ xr_zmod_wait() {
         _xr_el=$((_xr_el + _xr_st))
     done
 }
+
+# --- post-boot verification ---
+XR_TEE_ADDR=0x41b00000      # TEE_RAM, the only reservation kept in the old range
+XR_TEE_SIZE=0x100000
+XR_OLD_START=0x41900000     # the stock DSP/OP-TEE reservations: 0x41900000-0x4210ffff
+XR_OLD_END=0x42110000
+XR_MAX_FAILS=2              # consecutive boots that did not reach the system before the mode is disabled
+
+# xr_verify: check the reservations of the running kernel (after an xram_on boot) from two sources,
+# the flattened device tree ($XR_FDT /memreserve/) and memblock ($XR_MEMBLOCK, debugfs).
+# Sets XR_TEE: ok - TEE_RAM reserved; missing - a readable source shows it is not (either source wins);
+# unknown - neither source can be read. XR_ODD=1 - other /memreserve/ entries overlap the old range.
+# XR_LIST - the /memreserve/ list (for the log).
+xr_verify() {
+    XR_ODD=0
+    XR_LIST=$(xr_rsvmap "$XR_FDT")
+    _xr_ft=unknown
+    if [ -n "$XR_LIST" ]; then
+        _xr_ft=missing
+        for _xr_e in $XR_LIST; do
+            _xr_a=$((${_xr_e%/*}))
+            _xr_s=$((${_xr_e#*/}))
+            if [ $_xr_a -eq $((XR_TEE_ADDR)) ] && [ $_xr_s -eq $((XR_TEE_SIZE)) ]; then
+                _xr_ft=ok
+            elif [ $_xr_a -lt $((XR_OLD_END)) ] && [ $((_xr_a + _xr_s)) -gt $((XR_OLD_START)) ]; then
+                XR_ODD=1
+            fi
+        done
+    fi
+    # debugfs is normally not mounted this early; mount it only at the real path
+    if [ ! -r "$XR_MEMBLOCK" ] && [ "$XR_MEMBLOCK" = /sys/kernel/debug/memblock/reserved ]; then
+        mount -t debugfs none /sys/kernel/debug 2>/dev/null
+    fi
+    _xr_mt=unknown
+    if [ -r "$XR_MEMBLOCK" ] && [ -n "$(sed -n 1p "$XR_MEMBLOCK")" ]; then
+        _xr_mt=missing
+        for _xr_r in $(sed 's/.*: //' "$XR_MEMBLOCK"); do
+            _xr_a=${_xr_r%%..*}
+            _xr_b=${_xr_r##*..}
+            if [ $((_xr_a)) -le $((XR_TEE_ADDR)) ] && [ $((_xr_b)) -ge $((XR_TEE_ADDR + XR_TEE_SIZE - 1)) ]; then
+                _xr_mt=ok
+                break
+            fi
+        done
+    fi
+    if [ "$_xr_ft" = missing ] || [ "$_xr_mt" = missing ]; then
+        XR_TEE=missing
+    elif [ "$_xr_ft" = ok ] || [ "$_xr_mt" = ok ]; then
+        XR_TEE=ok
+    else
+        XR_TEE=unknown
+    fi
+}
