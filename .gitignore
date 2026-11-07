@@ -1,6 +1,3 @@
 .superpowers/
-tests/bench/fixtures/
-tests/bench/run/
-tests/uboot/src
-tests/uboot/build
-tests/uboot/t/
+docs/
+tests/
