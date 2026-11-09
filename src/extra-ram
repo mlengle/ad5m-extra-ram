@@ -148,6 +148,12 @@ xr_arm_now() {
         return 1
     fi
     _xr_rearm=""
+    if [ "$(xr_platform)" = zmod ] && xr_zmod_native; then
+        xr_put last zmod_native
+        xr_say "не взводится: zmod сам освобождает эту память ($XR_ZMOD_XR_MARK)" \
+            "not armed: zmod frees this memory itself ($XR_ZMOD_XR_MARK)"
+        return 1
+    fi
     if [ "$(xr_platform)" = zmod ]; then
         if [ "$XR_REARM_OURS" = 1 ] && xr_is_ours "$(xr_getenv bootcmd)"; then
             # re-arm with the eMMC edits of zmod's current boot_zmod, but only while zmod's eMMC state is still
@@ -241,6 +247,13 @@ xr_decide() {
             return 0
         fi
     done
+    # zmod with its own extra RAM mode: stand down (no arm-wait); the accounting above still ran for our last boot
+    if [ "$_xr_p" = zmod ] && xr_zmod_native; then
+        xr_put last zmod_native
+        xr_say "zmod сам освобождает эту память ($XR_ZMOD_XR_MARK), extra-ram не взводится; его можно удалить: extra-ram uninstall" \
+            "zmod frees this memory itself ($XR_ZMOD_XR_MARK), extra-ram does not arm; it can be removed: extra-ram uninstall"
+        return 0
+    fi
     # arming happens in the background: on zmod after its emmc.sh (it runs later and rewrites bootcmd), on
     # every platform only once the system has been up for XR_ARM_DELAY seconds, so a boot that hangs early
     # leaves the stock bootcmd behind
@@ -344,6 +357,9 @@ xr_cmd_install() {
         "missing:$_xi_miss (we do not ship binaries)"
 
     _xi_p=$(xr_platform)
+    if [ "$_xi_p" = zmod ] && xr_zmod_native; then
+        xr_refuse "$(xc_native_msg ru)" "$(xc_native_msg en)"
+    fi
     if [ "$_xi_p" = zmod ]; then
         _xi_exp=0
         # zmod's emmc.sh must have finished in this boot: arming before it ran would leave a bootcmd it does
@@ -363,9 +379,7 @@ xr_cmd_install() {
     fi
     _xi_mem=$(xr_mem_total)
     case "$_xi_mem" in ''|*[!0-9]*) xr_refuse "не удалось прочитать MemTotal" "cannot read MemTotal" ;; esac
-    [ "$_xi_mem" -le 163840 ] || xr_refuse \
-        "MemTotal $_xi_mem КБ больше 163840: платы 256 МБ не поддерживаются" \
-        "MemTotal $_xi_mem kB is above 163840: 256 MB boards are not supported"
+    # 128 and 256 MB boards alike: the gate is the verified dtb + OP-TEE (same files and addresses on both)
     xr_fw_check
     if [ "$XR_FW" != ok ]; then
         xr_refuse "прошивка не из списка проверенных ($XR_FWINFO). Пришлите эту строку автору, чтобы добавить прошивку" \
@@ -505,6 +519,35 @@ xc_reason_zmod_unknown() {
     fi
 }
 
+# xc_native_msg ru|en: why extra-ram is not needed on a zmod with its own extra RAM mode (no trailing period)
+xc_native_msg() {
+    if [ "$1" = ru ]; then
+        echo "zmod сам освобождает эту память (в его emmc.sh есть режим extra RAM, метка $XR_ZMOD_XR_MARK), extra-ram на этом zmod не нужен. Включение и выключение режима у zmod: файл $XR_ZMOD_EMMC/disable_extra_ram.txt"
+    else
+        echo "zmod frees this memory itself (its emmc.sh has the extra RAM mode, marker $XR_ZMOD_XR_MARK), extra-ram is not needed on this zmod. zmod's switch for the mode: the file $XR_ZMOD_EMMC/disable_extra_ram.txt"
+    fi
+}
+
+# xc_zmod_native_line: the "Extra RAM" line for a zmod with its own mode (call after xr_zmod_native succeeded)
+xc_zmod_native_line() {
+    if [ "$ZX_ON" = 1 ]; then
+        xr_verify
+        if [ "$XR_TEE" = missing ]; then
+            xr_msg "Дополнительная память: обеспечивает zmod: работает, но TEE_RAM НЕ зарезервирован (memreserve:${XR_LIST}), сообщите автору zmod" \
+                "Extra RAM: provided by zmod: active, but TEE_RAM is NOT reserved (memreserve:${XR_LIST}), report this to the zmod author"
+        elif [ "$XR_TEE" = ok ]; then
+            xr_msg "Дополнительная память: обеспечивает zmod: работает (MemTotal $(xr_mem_total) КБ, TEE_RAM зарезервирован)" \
+                "Extra RAM: provided by zmod: active (MemTotal $(xr_mem_total) kB, TEE_RAM reserved)"
+        else
+            xr_msg "Дополнительная память: обеспечивает zmod: работает (MemTotal $(xr_mem_total) КБ, резервирование TEE_RAM проверить не удалось)" \
+                "Extra RAM: provided by zmod: active (MemTotal $(xr_mem_total) kB, the TEE_RAM reservation could not be checked)"
+        fi
+    else
+        xr_msg "Дополнительная память: обеспечивает zmod: в этой загрузке не работает (xr_state.txt=$ZX_STATE, disable_extra_ram.txt=$ZX_DISABLE)" \
+            "Extra RAM: provided by zmod: not active in this boot (xr_state.txt=$ZX_STATE, disable_extra_ram.txt=$ZX_DISABLE)"
+    fi
+}
+
 # xc_reason CODE: print the explanation of a "last" reason code (why the mode is not active / not armed)
 xc_reason() {
     case "$1" in
@@ -535,6 +578,7 @@ xc_reason() {
     zmod_emmc_testing) xr_msg "zmod сейчас проверяет 50 МГц (state.txt не ok): режим не взводится, чтобы не смешивать сбои; взведётся после проверки" \
         "zmod is testing eMMC 50 MHz now (state.txt is not ok): not armed so the failures do not mix; it is armed after the test" ;;
     zmod_unknown_boot_zmod|zmod_unknown_bootcmd) xr_msg "$(xc_reason_zmod_unknown ru)" "$(xc_reason_zmod_unknown en)" ;;
+    zmod_native) xr_msg "$(xc_native_msg ru)" "$(xc_native_msg en)" ;;
     zmod_wait_timeout) xr_msg "zmod emmc.sh не закончил за 15 минут (идёт тест eMMC?), в ту загрузку режим не взведён" \
         "zmod emmc.sh did not finish in 15 minutes (eMMC test running?), not armed in that boot" ;;
     platform_changed) xr_msg "система сменилась (при установке: $(xr_inst platform), сейчас: $(xr_platform)), режим не взводится; переустановите zmod или extra-ram с флагом --experimental" \
@@ -561,6 +605,13 @@ xc_extra_ram() {
     _xc_last=$(xr_get last)
     _xc_state=$(xr_get state)
     _xc_why=""
+    if [ "$(xr_platform)" = zmod ] && xr_zmod_native; then
+        XC_LAST_SHOWN=1
+        xc_zmod_native_line
+        xr_msg "extra-ram установлен, но на этом zmod не взводится: zmod сам освобождает эту память. Его можно удалить: extra-ram uninstall" \
+            "extra-ram is installed but does not arm on this zmod: zmod frees this memory itself. It can be removed: extra-ram uninstall"
+        return 0
+    fi
     if grep -qw xram_on "$XR_CMDLINE" 2>/dev/null; then
         xr_verify
         if [ "$XR_TEE" = missing ]; then _xc_why=tee_missing
@@ -626,6 +677,11 @@ xc_zmod() {
 # extra-ram check: read-only report, exit 0 always
 xr_cmd_check() {
     if [ ! -f "$XR_STATE/installed" ]; then
+        if [ "$(xr_platform)" = zmod ] && xr_zmod_native; then
+            xc_zmod_native_line
+            xr_msg "$(xc_native_msg ru)" "$(xc_native_msg en)"
+            return 0
+        fi
         xr_msg "Дополнительная память: не установлено. Запустите extra-ram install" \
             "Extra RAM: not installed. Run extra-ram install"
         return 0

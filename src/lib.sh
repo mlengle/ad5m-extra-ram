@@ -28,9 +28,10 @@
 : ${XR_UPTIME:=/proc/uptime}
 : ${XR_ARM_DELAY:=180}                 # the boot hook arms only after the system has been up this many seconds
 
-# --- verified firmware list: "dtb-md5 CRC optee-md5" triplets (firmware 3.1.5) ---
+# --- verified firmware list: "dtb-md5 CRC optee-md5" triplets ---
 # CRC is the crc32 of sunxi.dtb as the printer's U-Boot prints it; the OP-TEE md5 is required in both
-# boot_package copies (sectors in XR_PKG_SECTORS).
+# boot_package copies (sectors in XR_PKG_SECTORS). The one triplet covers firmware 3.1.5 (128 MB board) and
+# 3.1.9 (256 MB board): both carry byte-identical sunxi.dtb and OP-TEE at the same sectors.
 XR_KNOWN='c4aabbae50d6f56c8db2109804456ed2 e82291d2 5ed6ffabbadb9926c7d44a9b4b833683'
 XR_PKG_SECTORS="32800 24576"
 
@@ -341,6 +342,29 @@ xr_zmod_state() {
     if grep -qw zmod_emmc_ddr "$XR_CMDLINE" 2>/dev/null; then ZM_MARK=zmod_emmc_ddr
     elif grep -qw zmod_emmc_50 "$XR_CMDLINE" 2>/dev/null; then ZM_MARK=zmod_emmc_50
     fi
+}
+
+# --- zmod with its own extra RAM mode ---
+# zmod 1.7 since 2026-11-09 (emmc.sh md5 b92335adf36faf9c5b5af4818d5d7ebf) frees the same reservations itself:
+# its boot_zmod carries "fdt rsvmem delete 3..0;fdt rsvmem add 0x41b00000 0x100000" next to the eMMC edits and
+# the marker zmod_xram_on; its state is in xr_state.txt / xr_fails.txt, its switch is disable_extra_ram.txt.
+# extra-ram then stands down (never installs, never arms): two owners of the same reservations and of the one-shot
+# bootcmd must not mix, and copying such a boot_zmod into our xram_boot would run "fdt rsvmem delete" twice, a
+# failing command that leaves the vendor U-Boot on the logo.
+XR_ZMOD_XR_MARK=zmod_xram_on
+
+# xr_zmod_native: succeeds when zmod has its own extra RAM mode: emmc.sh mentions zmod_xram_on, or boot_zmod edits
+# /memreserve/, or this boot carries zmod_xram_on (enabled or not: disable_extra_ram.txt does not count). Sets ZX_ON
+# (1 = zmod_xram_on in this boot), ZX_STATE (xr_state.txt or none) and ZX_DISABLE (0|1). Read-only.
+xr_zmod_native() {
+    ZX_ON=0; grep -qw "$XR_ZMOD_XR_MARK" "$XR_CMDLINE" 2>/dev/null && ZX_ON=1
+    ZX_STATE=""; [ -f "$XR_ZMOD_EMMC/xr_state.txt" ] && read -r ZX_STATE < "$XR_ZMOD_EMMC/xr_state.txt"
+    [ -n "$ZX_STATE" ] || ZX_STATE=none
+    ZX_DISABLE=0; [ -f "$XR_ZMOD_EMMC/disable_extra_ram.txt" ] && ZX_DISABLE=1
+    [ "$ZX_ON" = 1 ] && return 0
+    grep -q "$XR_ZMOD_XR_MARK" "$XR_ZMOD_SH" 2>/dev/null && return 0
+    case "$(xr_getenv boot_zmod)" in *"fdt rsvmem"*) return 0 ;; esac
+    return 1
 }
 
 # xr_zmod_edits: decide the eMMC edits for arming on zmod, from bootcmd and boot_zmod (U-Boot decides, not

@@ -1,15 +1,17 @@
-# extra-ram: +7 MB of RAM for the FlashForge AD5M (128 MB)
+# extra-ram: +7 MB of RAM for the FlashForge AD5M (128 MB and 256 MB)
 
 [Русский](README.ru.md)
 
 ## What it is
 
-`extra-ram` gives the printer back about 7 MB of RAM that sits unused on a 128 MB AD5M (where it comes from is explained in the next section):
+`extra-ram` gives the printer back about 7 MB of RAM that sits unused on the AD5M, on 128 MB and 256 MB boards alike (where it comes from is explained in the next section). On a 128 MB board:
 
 | | MemTotal |
 |---|---|
 | normal boot | 110,404 kB |
 | with extra-ram | 117,636 kB (+7,232 kB) |
+
+On a 256 MB board the same 7,232 kB are freed: `MemTotal` 247,584 kB with the mode (measured on firmware 3.1.9).
 
 The kernel gets these pages entirely as free memory, so `MemAvailable` grows by about the same 7.1 MB.
 Compared with 110 MB this looks like a small gain, but compared with the typical amount of free memory during a print 7 MB becomes noticeable. For comparison:
@@ -40,11 +42,12 @@ The memory layout and the exact U-Boot and Linux commands are described in [TECH
 
 ## Supported
 
-- **zmod** on a 128 MB AD5M: the main supported system. zmod's eMMC 50 MHz / DDR52 works together with extra-ram (details below).
-- **Firmware**: only one is in the verified list for now (`sunxi.dtb` md5 `c4aabbae50d6f56c8db2109804456ed2`). On any other firmware the installation refuses (see "If your firmware is not in the list").
+- **zmod** (1.7 without its own extra RAM mode) on a 128 MB or 256 MB AD5M: the main supported system. zmod's eMMC 50 MHz / DDR52 works together with extra-ram (details below).
+- **zmod with its own extra RAM mode** (zmod 1.7 from November 2026: its `emmc.sh` frees the same memory itself, kernel marker `zmod_xram_on`): extra-ram is **not needed** there. The installation refuses, an existing installation stops arming (remove it with `extra-ram uninstall`), and `check` shows the state of zmod's mode. zmod's switch for it is `/opt/config/mod_data/emmc/disable_extra_ram.txt`.
+- **256 MB boards**: supported, with the same reservations, addresses and checks as on 128 MB (firmware 3.1.9 carries the same `sunxi.dtb` and OP-TEE). The layout was verified on a 256 MB printer running zmod's own mode; extra-ram's own boot and `extra-ram test` have not yet been run on a 256 MB board.
+- **Firmware**: one `sunxi.dtb` is in the verified list for now (md5 `c4aabbae50d6f56c8db2109804456ed2`, found in firmware 3.1.5 and 3.1.9). On any other firmware the installation refuses (see "If your firmware is not in the list").
 It looks like FlashForge firmware updates never change this file, so extra-ram will very likely work on any 5M/5M Pro firmware, but we will know for sure only after wider testing by users.
 - **Rooted stock firmware and Forge-X**: experimental only, with the `--experimental` flag. It has **not been tested** on a printer.
-- 256 MB boards are not supported (the installation refuses).
 
 ## Installation
 
@@ -85,7 +88,8 @@ then run `cd /tmp/ad5m-extra-ram-main && sh install.sh` on the printer.
 - it is run as root;
 - zmod has finished its eMMC check (`emmc.sh`) in this boot (otherwise it refuses with "try again in a few minutes");
 - the printer is not printing (via Moonraker);
-- `MemTotal` is at most 160 MB (a 128 MB board);
+- `MemTotal` can be read (128 MB and 256 MB boards are both fine);
+- on zmod: zmod has no extra RAM mode of its own (otherwise it refuses: extra-ram is not needed);
 - the firmware is in the list (`sunxi.dtb` and OP-TEE in both copies of `boot_package`);
 - which system is installed (zmod, Forge-X, no modification);
 - `bootcmd` is the stock one, zmod's armed one or ours (a foreign `bootcmd` is a refusal);
@@ -149,6 +153,7 @@ The last output line is `RESULT PASS` or `RESULT FAIL`. The exit code is 0 only 
 - If zmod has already enabled 50 MHz, the extra-ram boot carries the **same eMMC edits** as `boot_zmod`, in the same boot. So after the boot zmod sees its own marker and the 50 MHz clock and counts the boot as successful. Conditions: zmod's `state.txt` is `ok` and `boot_zmod` matches one of the known strings (zmod 1.7; DDR52 and plain 50 MHz). If zmod is testing 50 MHz itself right now (`state.txt` is not `ok`), extra-ram is not armed, so the failures do not mix, and is armed after the test. If zmod's arming strings (`bootcmd` or `boot_zmod`) are not in the list of known ones (for example a new zmod version), the installation refuses (when zmod's own boot is armed at that moment), and an existing installation stops arming; `check` says so and shows the md5 of `emmc.sh`. New zmod versions are added to the list in `src/lib.sh`, the same way as firmware.
 - If zmod does not use 50 MHz (`disable.txt`, `state=fail`, no `emmc.sh` or `boot_zmod`), extra-ram arms without eMMC edits. This is the normal supported case.
 - extra-ram arms only after zmod's `emmc.sh` has finished in the current boot (a background wait of up to 15 minutes) and not earlier than 3 minutes after the boot: otherwise zmod would overwrite `bootcmd`.
+- If zmod has its own extra RAM mode (`zmod_xram_on`, see "Supported"), extra-ram does not arm at all: two owners of the same reservations and of the one-shot `bootcmd` must not mix.
 - extra-ram's U-Boot variables are its own (`xram_main`, `xram_boot`, `xram_del`, `xram_skip`), so removing zmod does not touch them and no reference to a missing variable is left behind.
 
 **If the extra-ram boot hangs** and you then power-cycle, zmod sees its one-shot boot without the marker and counts a 50 MHz failure: **it drops DDR52 at once** (deletes `ddr.txt`) and 50 MHz after 3 failures. extra-ram's own counter disables the mode after **two** failures in a row, i.e. before 50 MHz is given up.

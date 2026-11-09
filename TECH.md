@@ -1,6 +1,6 @@
 # extra-ram: technical notes
 
-How the reserved memory of the FlashForge AD5M (128 MB, Allwinner sunxi, stock firmware 3.1.5) is laid out, and the exact commands extra-ram uses to free it. For users see [README.md](README.md) / [README.ru.md](README.ru.md).
+How the reserved memory of the FlashForge AD5M (Allwinner R528 / sun8iw20; 128 MB board with stock firmware 3.1.5, 256 MB board with 3.1.9) is laid out, and the exact commands extra-ram uses to free it. For users see [README.md](README.md) / [README.ru.md](README.ru.md).
 
 ## 1. The reserved range
 
@@ -27,7 +27,12 @@ The DSP is started by the stock `bootcmd` (`run setargs_mmc boot_dsp0 boot_uImag
 
 **Why TEE_RAM must stay reserved.** Linux uses PSCI (secure monitor calls into OP-TEE) for `CPU_OFF`/`CPU_ON` and for reboot/poweroff. Freeing all 8 MB lets the page allocator overwrite TEE_RAM, and the first PSCI call (taking `cpu1` offline, reboot) hangs the SoC. With TEE_RAM kept, `cpu1` hotplug, reboots and a one-hour print were verified on the printer.
 
-Result: 8256 − 1024 = **7232 KB** freed. `MemTotal` 110404 → 117636 kB.
+Result: 8256 − 1024 = **7232 KB** freed.
+
+| Board | `MemTotal` stock | `MemTotal` with the mode |
+|---|---|---|
+| 128 MB (3.1.5) | 110404 kB | 117636 kB (measured) |
+| 256 MB (3.1.9) | 240352 kB (computed: 247584 − 7232) | 247584 kB (measured, zmod's own mode, §6) |
 
 ## 2. The one-shot U-Boot boot
 
@@ -64,7 +69,7 @@ On zmod with eMMC 50 MHz / DDR52 enabled, `xram_boot` also carries zmod's own `f
 `/etc/init.d/S45xram` → `extra-ram boot` (synchronous, early):
 
 - **Safety check.** It runs on every boot with `xram_on`, before anything else. TEE_RAM is checked in two sources:
-  - `/sys/firmware/fdt` (`/memreserve/` must contain exactly `0x41b00000/0x100000`);
+  - `/sys/firmware/fdt` (`/memreserve/` must contain `0x41b00000/0x100000`, and no other entry may overlap the old range `0x41900000–0x4210FFFF`; entries outside it are U-Boot's own, see §5);
   - `/sys/kernel/debug/memblock/reserved` (a range must cover `0x41b00000–0x41bfffff`).
 
   If either source shows it missing, the hook writes the stock `bootcmd`, disables the mode and reboots (`reboot`, then `reboot -f`).
@@ -86,15 +91,68 @@ Freed pages can be seen in `/sys/kernel/debug/memblock/reserved`: the range `0x4
 | uninstall | disarm, read `bootcmd` back, then `fw_setenv -s` deleting every `xram_*` variable |
 | verify (Linux) | `/proc/cmdline`, `/sys/firmware/fdt`, `/sys/kernel/debug/memblock/reserved`, `/proc/meminfo` |
 | firmware check | mount boot-resource read-only, `md5sum sunxi.dtb`, OP-TEE md5 from `boot_package` on `/dev/mmcblk0` |
+| zmod's own mode (§6) | `grep zmod_xram_on` in zmod's `emmc.sh` and `/proc/cmdline`, `fdt rsvmem` in `fw_printenv -n boot_zmod`; read `xr_state.txt`, `disable_extra_ram.txt` |
 
 zmod's files and its U-Boot variables (`boot_zmod`, `zmod_*`) are only ever read.
 
-## 5. Sources and references
+## 5. The 256 MB board
+
+Data from a 256 MB printer (`xram-collect-20261109-111545`, collected with `tools/collect.sh`), stock firmware 3.1.9, kernel `5.4.61 #52 SMP PREEMPT Wed Aug 23 15:33:33 CST 2023`, U-Boot `2018.05(08/25/2023-17:05:54)`:
+
+| What | 256 MB board | Same as 128 MB / 3.1.5? |
+|---|---|---|
+| RAM | `memory@40000000` reg `0x40000000 0x10000000`, `androidboot.dramsize=256` | no (128 MB: `0x08000000`) |
+| `sunxi.dtb` md5 | `c4aabbae50d6f56c8db2109804456ed2` (so the CRC is `e82291d2` too) | yes |
+| its `/memreserve/` | the four entries of §1 | yes |
+| `boot_package` | copies at sectors 32800 and 24576 (also found by scanning the first 32 MB) | yes |
+| OP-TEE md5 (both copies) | `5ed6ffabbadb9926c7d44a9b4b833683`, 300248 bytes at offset `0xec800` | yes |
+| U-Boot environment | `boot_uImage`, `boot_dsp0`, `setargs_mmc` as on 3.1.5; `fw_env.config` `/dev/mmcblk0p2` + `p3`, `0x20000` | yes |
+| partitions | `boot-resource@mmcblk0p1 … UDISK@mmcblk0p7` | yes |
+
+So `XR_KNOWN` matches unchanged, and every address extra-ram uses (`0x43000000` kernel, `0x44864e70` dtb, `0x44864e00` CRC scratch word, `0x41b00000` TEE_RAM) is the one the stock `boot_uImage` and OP-TEE use on both boards. The only 128 MB assumption was the install-time refusal above `MemTotal` 163840 kB, which is gone.
+
+With the mode active (§6) the board showed:
+
+- memblock: `0x41900000–0x4210ffff` gone, `0x41b00000..0x41bfffff` reserved, `cpu1` online;
+- the live `/sys/firmware/fdt` `/memreserve/` has three entries: `0x41b00000/0x100000` (TEE_RAM), `0x4c864e70/0xe190` (U-Boot's relocated copy of the dtb itself) and `0x4c8ee000/0x177000` (`disp_reserve=1536000,0x4c8ee000`, the boot-logo framebuffer). The last two are above the old range, so the safety check does not count them as unexpected.
+
+Not yet run on a 256 MB board: extra-ram's own `xram_main` boot (the CRC gate in U-Boot) and `extra-ram test`. The harvester of `extra-ram test` allocates a fixed 16 × 1 MB, so on 256 MB it may hold fewer pages of the freed range; its PASS only needs more than zero.
+
+## 6. zmod's own mode (`zmod_xram_on`)
+
+zmod 1.7 (upstream branch `1.7` from 2026-11-09, `.shell/emmc.sh` md5 `b92335adf36faf9c5b5af4818d5d7ebf`) frees the same memory itself. It is enabled by default and adds the edits of `xram_del` to its eMMC edits in `boot_zmod`. On the 256 MB printer (DDR52, method A):
+
+```
+boot_zmod = fdt rm /soc@3000000/sdmmc@4020000 mmc-hs200-1_8v;fdt set /soc@3000000/sdmmc@4020000 max-frequency <0x2faf080>;
+            fdt rsvmem delete 3;fdt rsvmem delete 2;fdt rsvmem delete 1;fdt rsvmem delete 0;fdt rsvmem add 0x41b00000 0x100000;
+            setenv bootargs ${bootargs} zmod_emmc_ddr zmod_xram_on;run boot_uImage
+bootcmd   = setenv bootcmd run setargs_mmc boot_dsp0 boot_uImage;saveenv;run setargs_mmc boot_dsp0 boot_zmod
+```
+
+State is in `/opt/config/mod_data/emmc/`: `xr_state.txt` (`trial`/`ok`/`fail`), `xr_fails.txt` (fail after 3), and the switch `disable_extra_ram.txt`. Differences from extra-ram:
+
+| | extra-ram | zmod's mode |
+|---|---|---|
+| firmware gate | `sunxi.dtb` md5 + OP-TEE md5 in both `boot_package` copies (Linux), dtb CRC (U-Boot) | `sunxi.dtb` md5 (Linux) |
+| DSP firmware | not loaded (`boot_dsp0` is not run) | loaded by `boot_dsp0` into `0x42000000`, then that range is unreserved |
+| TEE_RAM check after boot | `/sys/firmware/fdt` and memblock (§3) | `41b00000` in memblock |
+
+**extra-ram stands down on such a zmod.** `xr_zmod_native` (`src/lib.sh`) detects it when zmod's `emmc.sh` mentions `zmod_xram_on`, `boot_zmod` contains `fdt rsvmem`, or the cmdline carries `zmod_xram_on`. It counts even with `disable_extra_ram.txt`. Then:
+
+- `install` refuses before touching anything (the reason is printed, with zmod's switch);
+- the boot hook still accounts for our last boot, then sets `last=zmod_native` and starts no `arm-wait`; `xr_arm_now` refuses the same way;
+- `check` shows zmod's mode instead (active with `MemTotal` and the TEE_RAM check, or not active with `xr_state.txt` / `disable_extra_ram.txt`) and suggests `extra-ram uninstall`;
+- `uninstall` works as before.
+
+Why this variant is not added to `XR_ZMOD_KNOWN`: its edits, copied into `xram_boot`, already delete the four entries, so `xram_del` would then run `fdt rsvmem delete 3` on a one-entry table. That command fails, and the vendor U-Boot then stays on the logo. zmod would also count every extra-ram boot (its eMMC marker without `zmod_xram_on`) as a failure of its own mode. Its `boot_zmod` is also built from flags (method A/B, 50 MHz/DDR52, eMMC on/off, mode on/off), so a verbatim table could not cover it. `grep -w xram_on` does not match `zmod_xram_on` (`_` is a word character), so the safety check of §3 never acts on zmod's boots.
+
+## 7. Sources and references
 
 - the `/memreserve/` table of the stock `sunxi.dtb` (boot-resource partition) and of the live `/sys/firmware/fdt`;
 - the OP-TEE image header and its memory tables inside `boot_package` (`/dev/mmcblk0`, sectors 32800 and 24576);
 - the vendor U-Boot environment (`fw_printenv`) and the behaviour of the vendor U-Boot 2018.05, tried on the printer
 - boot and memory experiments on the printer
+- the read-only data collection of a 256 MB printer (`tools/collect.sh`, archive `xram-collect-20261109-111545`) and zmod's `.shell/emmc.sh` of upstream branch `1.7` (<https://github.com/ghzserg/zmod>, the mirror `ghzserg/z_ff5m`), md5 `b92335adf36faf9c5b5af4818d5d7ebf`
 
 Public documentation for the formats and commands involved:
 

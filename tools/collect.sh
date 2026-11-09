@@ -16,7 +16,7 @@ D=/tmp/$NAME
 OUT=/tmp/$NAME.tar.gz
 MMC=/dev/mmcblk0
 BOOTRES=/dev/mmcblk0p1
-PKG_SECTORS="32800 24576"   # boot_package copies on firmware 3.1.5 (128 MB board)
+PKG_SECTORS="32800 24576"   # boot_package copies on firmware 3.1.5 (128 MB board) and 3.1.9 (256 MB board)
 MP=/tmp/xram-collect-mnt.$$
 MP_MOUNTED=0
 DBG_MOUNTED=0
@@ -142,7 +142,12 @@ fw_printenv 2>&1 | awk -F= '{ n = tolower($1) }
 {
     echo "== zmod emmc.sh"; md5sum /usr/data/zmod/zmod/.shell/emmc.sh 2>&1
     echo "== zmod S99moon"; ls -la /etc/init.d/S99moon 2>&1
-    echo "== zmod emmc state"; ls -la /opt/config/mod_data/emmc 2>&1; cat /opt/config/mod_data/emmc/state.txt 2>&1
+    echo "== zmod emmc state"; ls -la /opt/config/mod_data/emmc 2>&1
+    # the small state files (state, fails, version, boot id, zmod's own extra RAM mode xr_state / xr_fails)
+    for f in /opt/config/mod_data/emmc/*.txt; do
+        [ -f "$f" ] && [ "$(wc -c < "$f")" -le 64 ] && echo "$f: $(cat "$f" 2>&1)"
+    done
+    echo "== zmod emmc log (last 40 lines)"; tail -n 40 /opt/config/mod_data/log/emmc/emmc.log 2>&1
     echo "== Forge-X"; ls -d /opt/config/mod/.shell 2>&1
     echo "== init scripts"; ls -la /etc/init.d 2>&1
     echo "== extra-ram"; ls -la /opt/extra-ram /etc/extra-ram 2>&1
